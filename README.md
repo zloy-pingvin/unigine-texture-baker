@@ -2,7 +2,7 @@
 
 Plugin that bakes texture sets from a high-poly model (multi-material model) onto a low-poly model’s UV layout — albedo (_alb), shading (_sh: metalness/roughness/specular), normal (_n) and optional emission (_e).
 
-It may be useful for baking simplified LODs for distant objects
+Typical use: baking full texture sets for simplified distant LODs of multi-material models.
 
 ![UNIGINE](https://img.shields.io/badge/UNIGINE-2.21-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
