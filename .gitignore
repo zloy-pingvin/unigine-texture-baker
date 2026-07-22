@@ -1,0 +1,5 @@
+build*/
+lbuild*/
+*.user
+.vs/
+.cache/

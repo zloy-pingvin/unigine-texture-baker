@@ -1,0 +1,8 @@
+{
+  "Name": "Baker",
+  "Vendor": "zloy_pingvin",
+  "Description": "Texture baker: transfers albedo/roughness/normal from a high-poly model to a low-poly model UV set. By zloy_pingvin — https://github.com/zloy-pingvin/unigine-texture-baker — https://t.me/zloytux",
+  "Version": "0.4.0.0",
+  "CompatVersion": "0.4.0.0",
+  "Dependencies": []
+}
