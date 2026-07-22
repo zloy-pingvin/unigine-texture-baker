@@ -60,9 +60,12 @@ Copy `bin/plugins/zloy_pingvin/Baker/` into your project's `bin` folder (keep th
 
 ## Quick start
 
-1. **Models tab**: select the high-poly node in the scene and press *Select* (or drag nodes from World Nodes onto the High-poly section). Same for the low-poly.
-2. Pick the output resolution; adjust the frontal/rear distances in *Settings* if needed.
-3. Press **Bake**. Textures are saved next to the low-poly mesh asset; the material is created/updated automatically.
+- Open the tool: menu Windows -> Texture Baker
+- Select the high-poly node in the scene and press Select (or drag nodes from World Nodes onto the High-poly section). Same for the low-poly.
+- Pick the output resolution; adjust the frontal/rear distances in Settings if needed.
+- Press Bake. Textures are saved next to the low-poly mesh asset; the material is created/updated automatically.
+- If details bake with a sideways slide, press Paint skew mask, paint the problem areas white, save, enable "use skew mask" and re-bake. 
+If a neighboring part imprints onto another one, use Groups (manual pairs or by-name matching).
 
 If details bake with a sideways slide, press **Paint skew mask**, paint the problem areas white, save, enable *use skew mask* and re-bake. If a neighboring part imprints onto another one, use *Groups* (manual pairs or by-name matching).
 
@@ -71,10 +74,22 @@ If details bake with a sideways slide, press **Paint skew mask**, paint the prob
 - The low-poly UV0 must be a unique layout inside the 0..1 tile (the standard +1-offset overlap workflow is supported).
 - This repository contains only the plugin source — no UNIGINE SDK files are included or required to browse it; the SDK is needed only to build.
 
+## Debug tab
+
+- As rendered (GPU) - the main bake mode: the engine renders the high-poly materials into the capture (layers, masks, tiling, colors). 
+Disable to sample only the base material textures on the CPU (faster, but layered materials lose their layers).
+- Capture unwrap (auto / UV0 / UV1) - which UV channel the GPU capture unwraps the high-poly into. Auto picks the channel with less chart overlap per surface (the choice is logged to the console). 
+Change only if a second-UV-driven layer bakes wrong.
+- Invert G (Y) - extra inversion of the normal map green channel. Normally not needed; enable only if the baked relief looks inverted.
+- Colorize hit zones - bakes a diagnostic colorization instead of albedo: green - the ray hit a surface above the low-poly, blue - below, red - a back face, yellow - the skew mask area, 
+black/stretched - a miss. Also dumps the GPU capture atlases to the system temp folder (baker_captures) for inspection.
+- Rays along shading normals - cast rays along the shading normals instead of the position-smoothed cage normals. 
+May remove projection skew on faceted surfaces, but produces gaps at hard edges.
+
 ## License
 
 The plugin source code is licensed under the [MIT License](LICENSE). The UNIGINE SDK is proprietary software available at [unigine.com](https://unigine.com).
 
 ## Contact
 
-Telegram: https://t.me/zloytux
+Telegram: https://t.me/zloy_pingvin
