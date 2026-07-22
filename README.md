@@ -67,8 +67,6 @@ Copy `bin/plugins/zloy_pingvin/Baker/` into your project's `bin` folder (keep th
 - If details bake with a sideways slide, press Paint skew mask, paint the problem areas white, save, enable "use skew mask" and re-bake. 
 If a neighboring part imprints onto another one, use Groups (manual pairs or by-name matching).
 
-If details bake with a sideways slide, press **Paint skew mask**, paint the problem areas white, save, enable *use skew mask* and re-bake. If a neighboring part imprints onto another one, use *Groups* (manual pairs or by-name matching).
-
 ## Notes
 
 - The low-poly UV0 must be a unique layout inside the 0..1 tile (the standard +1-offset overlap workflow is supported).
