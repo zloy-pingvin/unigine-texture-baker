@@ -15,9 +15,10 @@
 # directly on /mnt/f is an order of magnitude slower (9p filesystem).
 set -e
 
-WIN_PROJECT=/mnt/f/repository/Ungine_addons/Baker
-WORK=~/baker-linux
-QT=/opt/qt/6.5.3/gcc_64
+# Override via environment: WIN_PROJECT=<path to the UNIGINE project> QT=<Qt gcc_64>
+WIN_PROJECT=${WIN_PROJECT:-/mnt/f/repository/Ungine_addons/Baker}
+WORK=${WORK:-~/baker-linux}
+QT=${QT:-/opt/qt/6.5.3/gcc_64}
 
 echo "=== syncing sources ==="
 mkdir -p $WORK/source/plugins/zloy_pingvin $WORK/lib

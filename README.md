@@ -69,11 +69,11 @@ If details bake with a sideways slide, press **Paint skew mask**, paint the prob
 ## Notes
 
 - The low-poly UV0 must be a unique layout inside the 0..1 tile (the standard +1-offset overlap workflow is supported).
-- This repository contains only the plugin source. The UNIGINE SDK (headers, libraries, editor) is proprietary and must be obtained from [unigine.com](https://unigine.com).
+- This repository contains only the plugin source — no UNIGINE SDK files are included or required to browse it; the SDK is needed only to build.
 
 ## License
 
-[MIT](LICENSE). Not affiliated with UNIGINE.
+The plugin source code is licensed under the [MIT License](LICENSE). The UNIGINE SDK is proprietary software available at [unigine.com](https://unigine.com).
 
 ## Contact
 
