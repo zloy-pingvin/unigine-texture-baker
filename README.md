@@ -1,8 +1,8 @@
 # Texture Baker for UNIGINE
 
-UNIGINE 2.21 Editor plugin that bakes texture sets from a high-poly model onto a low-poly model's UV layout — albedo (`_alb`), shading (`_sh`: metalness/roughness/specular), normal (`_n`) and optional emission (`_e`).
+Plugin that bakes texture sets from a high-poly model (multi-material model) onto a low-poly model’s UV layout — albedo (_alb), shading (_sh: metalness/roughness/specular), normal (_n) and optional emission (_e).
 
-By [zloy_pingvin](https://t.me/zloytux).
+It may be useful for baking simplified LODs for distant objects
 
 ![UNIGINE](https://img.shields.io/badge/UNIGINE-2.21-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
