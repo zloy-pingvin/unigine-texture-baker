@@ -6,6 +6,7 @@
 #include <UnigineString.h>
 
 #include <functional>
+#include <map>
 #include <vector>
 
 namespace BakeCore
@@ -16,6 +17,13 @@ struct Settings
 	int resolution = 2048;        // output textures are resolution x resolution
 	float frontalDistance = 0.05f; // meters; how far ABOVE the low-poly surface to search (cage offset)
 	float rearDistance = 0.05f;    // meters; how far BELOW the low-poly surface to search
+	// Per-part cage overrides, keyed by LOW-POLY node id, {frontal, rear} in
+	// meters. The cage offsets the ray ORIGIN from the low-poly surface, so it
+	// belongs to the low-poly part, not to the high-poly one. Parts without an
+	// entry use frontalDistance/rearDistance above: one part that sits far from
+	// its high-poly no longer forces a big cage on the whole model (a global
+	// cage large enough for it makes neighbouring parts catch foreign detail).
+	std::map<int, Unigine::Math::vec2> partCage;
 	int supersamples = 4;          // 1, 4, 16 or 64 rays per texel (grid)
 	bool flipNormalY = false;      // extra G-channel flip; engine shaders sample maps as-is,
 	                               // so with basis matching normalizationTBN no flip is needed
@@ -30,6 +38,19 @@ struct Settings
 	// Marmoset's paint skew), black = smoothed cage normal, gray = blend.
 	bool useSkewMask = true;
 	bool bakeEmission = false; // additionally bake the emission texture (_e)
+	// project the scene's world decals (DecalOrtho/Proj/Mesh) onto the bake, so
+	// stickers/labels/dirt that live as separate decal nodes end up in the
+	// low-poly texture set.
+	bool bakeDecals = false;
+	// explicit decal node IDs to project (user-picked in the editor). Empty =
+	// auto: walk the scene hierarchy and take every decal overlapping the
+	// high-poly. Explicit picking is more reliable for decals nested inside
+	// node references (correct instance world transforms).
+	std::vector<int> decalNodeIds;
+	// max distance (meters) a mesh-decal may project onto a target surface: bind
+	// only to geometry within this band of the decal mesh (kills ghost
+	// projections onto foreign parts sharing the same projection column).
+	float decalDistance = 0.01f;
 	int dilationPixels = 16;    // edge padding size
 	// base name for the output textures/material; empty = derived from the
 	// first high-poly object (see suggestBaseName)
@@ -78,6 +99,15 @@ Result bake(const std::vector<BakeGroup> &groups,
 // Creates (or reuses) the low-poly material, assigns the baked textures and
 // neutralizes the multipliers. Fills result.materialPath.
 void assignMaterial(const std::vector<BakeGroup> &groups, Result &result);
+
+// Suggests a cage per low-poly part: probes each part with sparse rays along
+// its shading normals and returns the smallest {frontal, rear} (meters) that
+// still catches almost all of the high-poly detail in front of / behind it,
+// plus a safety margin. Keyed by low-poly node id, ready for Settings::partCage.
+// maxProbe caps how far to look (meters). Parts whose probes never hit are left
+// out of the result, so the caller keeps its current value for them.
+std::map<int, Unigine::Math::vec2> suggestPartCage(const std::vector<BakeGroup> &groups,
+	float maxProbe, const ProgressFn &progress);
 
 // Collects the node itself (if it is a Static Mesh) and all Static Mesh
 // descendants. Hidden (disabled) nodes are included: hiding is a viewport

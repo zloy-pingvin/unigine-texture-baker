@@ -14,6 +14,7 @@
 #include <UnigineLog.h>
 #include <UnigineObjects.h>
 #include <UnigineRender.h>
+#include <UnigineNodes.h>
 #include <UnigineWorld.h>
 
 #include <QAction>
@@ -46,11 +47,49 @@
 #include <QTreeWidget>
 #include <QVBoxLayout>
 
+#if defined(_WIN32)
+#	include <windows.h>
+#elif defined(_LINUX)
+#	include <cstdio>
+#endif
+
 #include <algorithm>
+#include <cmath>
+#include <functional>
+#include <set>
 #include <cstring>
 #include <vector>
 
 using namespace Unigine;
+
+// Physical memory the machine can still hand out, in bytes; 0 = unknown.
+// Unigine::Memory only reports the engine's OWN allocations, so this needs a
+// platform call.
+static double availablePhysicalMemory()
+{
+#if defined(_WIN32)
+	MEMORYSTATUSEX status;
+	status.dwLength = sizeof(status);
+	if (GlobalMemoryStatusEx(&status))
+		return double(status.ullAvailPhys);
+#elif defined(_LINUX)
+	// MemAvailable is the kernel's own estimate of what can be allocated
+	// without pushing the machine into swap; sysinfo()'s freeram ignores
+	// reclaimable page cache and would under-report by gigabytes.
+	if (FILE *f = std::fopen("/proc/meminfo", "r"))
+	{
+		char line[256];
+		double kb = 0.0;
+		while (std::fgets(line, sizeof(line), f))
+			if (std::sscanf(line, "MemAvailable: %lf kB", &kb) == 1)
+				break;
+		std::fclose(f);
+		if (kb > 0.0)
+			return kb * 1024.0;
+	}
+#endif
+	return 0.0;
+}
 
 // The editor has no API to query its UI language: read its own config
 // (%LOCALAPPDATA%/unigine/Editor/editor1.1.cfg, JSON): "editor/language" is
@@ -138,6 +177,9 @@ BakerWindow::BakerWindow(QWidget *parent)
 	const QString hideText = tr2("Скрыть", "Hide");
 	const QString hideTip = tip2(
 		"Скрыть/показать меши слота во вьюпорте (удобно при рисовании маски).\n"
+		"У high-poly вместе с мешами скрываются и его декали. Декали внутри\n"
+		"Node Reference поодиночке не скрываются, поэтому такая ссылка гасится\n"
+		"целиком (вместе со своими мешами).\n"
 		"На запекание не влияет: скрытые модели запекаются как обычно.",
 		"Hide/show the slot meshes in the viewport (handy while painting the mask).\n"
 		"Does not affect baking: hidden models bake as usual.");
@@ -216,34 +258,121 @@ BakerWindow::BakerWindow(QWidget *parent)
 	// row 4: striped participants list (dark rows = high-poly, gray = low-poly),
 	// also a drop target for nodes dragged from the World Nodes hierarchy
 	meshTree_ = new QTreeWidget();
-	meshTree_->setColumnCount(2);
+	// 0 = name, 1/2 = per-part cage (low-poly rows only), 3 = remove button
+	meshTree_->setColumnCount(4);
 	meshTree_->setHeaderHidden(true);
 	meshTree_->header()->setStretchLastSection(false);
 	meshTree_->header()->setSectionResizeMode(0, QHeaderView::Stretch);
 	meshTree_->header()->setSectionResizeMode(1, QHeaderView::Fixed);
-	meshTree_->setColumnWidth(1, 24);
-	meshTree_->setRootIsDecorated(false);
-	meshTree_->setSelectionMode(QAbstractItemView::NoSelection);
-	meshTree_->setFocusPolicy(Qt::NoFocus);
-	meshTree_->setMinimumHeight(120);
+	meshTree_->header()->setSectionResizeMode(2, QHeaderView::Fixed);
+	meshTree_->header()->setSectionResizeMode(3, QHeaderView::Fixed);
+	meshTree_->setColumnWidth(1, 54);
+	meshTree_->setColumnWidth(2, 54);
+	meshTree_->setColumnWidth(3, 24);
+	// section headers fold, so a long high-poly list can be tucked away while
+	// working on the low-poly one
+	meshTree_->setRootIsDecorated(true);
+	// editing the cage cells needs a current item, so rows are selectable and
+	// the widget takes focus (it was a pure display list before)
+	meshTree_->setSelectionMode(QAbstractItemView::SingleSelection);
+	meshTree_->setEditTriggers(QAbstractItemView::DoubleClicked
+		| QAbstractItemView::SelectedClicked | QAbstractItemView::EditKeyPressed);
+	// the participants list is the main working area of the window: give it a
+	// tall floor and let it absorb any spare vertical space
+	meshTree_->setMinimumHeight(320);
+	meshTree_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 	meshTree_->setAcceptDrops(true);
 	meshTree_->viewport()->setAcceptDrops(true);
 	meshTree_->viewport()->installEventFilter(this);
 	meshTree_->setToolTip(tip2(
-		"Участники запекания. Тёмные строки — high-poly, светлые — low-poly.\n"
-		"Перетащите ноды из окна World Nodes на секцию High-poly или Low-poly —\n"
-		"они добавятся к списку. ✕ убирает меш из списка.",
-		"Bake participants. Dark rows — high-poly, light rows — low-poly.\n"
-		"Drag nodes from the World Nodes window onto the High-poly or Low-poly\n"
-		"section to add them. ✕ removes a mesh from the list."));
+		"Участники запекания. Синий - high-poly, сиреневый - low-poly, зелёный - декали.\n"
+		"Колонки вперёд/назад у low-poly - кейдж детали, метры. Серое значение наследует\n"
+		"общее, яркое задано вручную. Двойной щелчок - правка, пустое поле - сброс оси.\n"
+		"Перетаскивание нод из World Nodes добавляет их в секцию, ✕ убирает.\n"
+		"Щелчок по заголовку сворачивает секцию.\n",
+		"Bake participants. Blue - high-poly, mauve - low-poly, green - decals.\n"
+		"The front/back columns on low-poly rows are that part's cage, meters. A dimmed\n"
+		"value inherits the global one, a bright value is explicit. Double-click edits,\n"
+		"an empty field resets that axis.\n"
+		"Dragging nodes from World Nodes adds them to a section, ✕ removes.\n"
+		"Clicking a header collapses the section."));
 	// clicking the ✕ column removes the mesh from its slot
-	connect(meshTree_, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem *item, int column) {
-		if (column != 1 || !item->parent())
+	// a cage cell was edited: empty text returns the part to the global value
+	connect(meshTree_, &QTreeWidget::itemChanged, this, [this](QTreeWidgetItem *item, int column) {
+		if (treeUpdating_ || !item->parent() || (column != 1 && column != 2))
 			return;
+		const int id = item->data(0, Qt::UserRole).toInt();
+		// the cage lives on low-poly rows only; sections are identified by key
+		// because groups mode adds a variable number of them
+		const QString sectionKey = item->parent()->data(0, Qt::UserRole).toString();
+		if (!id || !(sectionKey == "low" || sectionKey.endsWith("lo")))
+			return;
+		const QString text = item->text(column).trimmed().replace(',', '.');
+		bool ok = false;
+		const double value = text.toDouble(&ok);
+		// each axis is independent: clearing one cell returns only that axis to
+		// the global setting
+		PartCage pc = partCage_.count(id) ? partCage_[id] : PartCage();
+		if (text.isEmpty())
+		{
+			if (column == 1)
+				pc.hasFrontal = false;
+			else
+				pc.hasRear = false;
+		}
+		else if (ok)
+		{
+			const float v = float(qBound(0.0, value, 10.0));
+			if (column == 1)
+			{
+				pc.hasFrontal = true;
+				pc.frontal = v;
+			}
+			else
+			{
+				pc.hasRear = true;
+				pc.rear = v;
+			}
+		}
+		if (pc.any())
+			partCage_[id] = pc;
+		else
+			partCage_.erase(id);
+		treeUpdating_ = true;
+		fillCageCells(item, id);
+		treeUpdating_ = false;
+	});
+
+	// remember folding across the rebuilds refreshMeshTree() does
+	connect(meshTree_, &QTreeWidget::itemExpanded, this, [this](QTreeWidgetItem *item) {
+		if (!treeUpdating_ && !item->parent())
+			collapsedSections_.erase(item->data(0, Qt::UserRole).toString());
+	});
+	connect(meshTree_, &QTreeWidget::itemCollapsed, this, [this](QTreeWidgetItem *item) {
+		if (!treeUpdating_ && !item->parent())
+			collapsedSections_.insert(item->data(0, Qt::UserRole).toString());
+	});
+
+	connect(meshTree_, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem *item, int column) {
+		// the whole header row folds, not just the little arrow
+		if (!item->parent())
+		{
+			item->setExpanded(!item->isExpanded());
+			return;
+		}
+		if (column != 3 || manualGroups())
+			return; // group sections are defined by their root node, not per mesh
 		const int id = item->data(0, Qt::UserRole).toInt();
 		if (!id)
 			return;
-		const bool high = meshTree_->indexOfTopLevelItem(item->parent()) == 0;
+		const int section = meshTree_->indexOfTopLevelItem(item->parent()); // 0 hi, 1 lo, 2 decals
+		if (section == 2)
+		{
+			decalIds_.erase(std::remove(decalIds_.begin(), decalIds_.end(), id), decalIds_.end());
+			refreshMeshTree();
+			return;
+		}
+		const bool high = section == 0;
 		std::vector<int> &ids = high ? highIds_ : lowIds_;
 		// a mesh leaving a hidden slot must become visible again
 		if ((high ? highHideButton_ : lowHideButton_)->isChecked())
@@ -252,11 +381,79 @@ BakerWindow::BakerWindow(QWidget *parent)
 		ids.erase(std::remove(ids.begin(), ids.end(), id), ids.end());
 		if (high)
 			updateSuggestedName();
+		else
+			partCage_.erase(id); // drop this part's cage with the part itself
 		updateSlotLabels();
 		refreshMeshTree();
 		setUiLocked(baking_);
 	});
 	modelsLayout_->addRow(meshTree_);
+
+	// per-part cage helpers, right under the list they act on
+	{
+		auto cageRow = new QHBoxLayout();
+		autoCageButton_ = new QPushButton(tr2("Подобрать кейдж", "Fit cage"));
+		autoCageButton_->setToolTip(tip2(
+			"Промеряет каждую low-poly деталь лучами и ставит минимальные дистанции,\n"
+			"при которых её high-poly попадает в запечку.\n"
+			"Общие дистанции - потолок: значения только уменьшаются. Ось, которой нужно\n"
+			"больше потолка, остаётся унаследованной.\n",
+			"Probes each low-poly part with rays and sets the minimum distances that still\n"
+			"catch its high-poly.\n"
+			"The global distances are the ceiling: values are only lowered. An axis that\n"
+			"needs more than the ceiling stays inherited."));
+		connect(autoCageButton_, &QPushButton::clicked, this, &BakerWindow::onAutoCage);
+		cageRow->addWidget(autoCageButton_);
+
+		resetCageButton_ = new QPushButton(tr2("Сбросить к общему", "Reset to global"));
+		resetCageButton_->setToolTip(tip2(
+			"Убирает индивидуальные дистанции у всех деталей — они снова следуют\n"
+			"общим настройкам.",
+			"Drops the per-part distances so every part follows the global settings again."));
+		resetCageButton_->setEnabled(false);
+		connect(resetCageButton_, &QPushButton::clicked, this, &BakerWindow::resetAllPartCage);
+		cageRow->addWidget(resetCageButton_);
+		modelsLayout_->addRow(cageRow);
+
+		// the global pair lives right under the buttons that act on it: it is
+		// both the default for every part and the ceiling the fitting obeys
+		frontalSpin_ = new QDoubleSpinBox();
+		frontalSpin_->setDecimals(4);
+		frontalSpin_->setRange(0.0001, 100.0);
+		frontalSpin_->setSingleStep(0.01);
+		frontalSpin_->setValue(0.05);
+		frontalSpin_->setSuffix(tr2(" м", " m"));
+		frontalSpin_->setToolTip(tip2(
+			"Дистанция вперёд, метры: насколько выше поверхности low-poly искать high-poly.\n"
+			"Значение по умолчанию для деталей и потолок для \"Подобрать кейдж\".\n",
+			"Frontal distance, meters: how far above the low-poly surface to search for\n"
+			"high-poly detail. Default for parts and the ceiling for Fit cage."));
+
+		rearSpin_ = new QDoubleSpinBox();
+		rearSpin_->setDecimals(4);
+		rearSpin_->setRange(0.0, 100.0);
+		rearSpin_->setSingleStep(0.01);
+		rearSpin_->setValue(0.05);
+		rearSpin_->setSuffix(tr2(" м", " m"));
+		rearSpin_->setToolTip(tip2(
+			"Дистанция назад, метры: насколько ниже поверхности low-poly искать.\n"
+			"Значение по умолчанию для деталей и потолок для \"Подобрать кейдж\".\n",
+			"Rear distance, meters: how far below the low-poly surface to search.\n"
+			"Default for parts and the ceiling for Fit cage."));
+
+		auto globalCageRow = new QHBoxLayout();
+		globalCageRow->addWidget(new QLabel(tr2("Кейдж вперёд:", "Cage front:")));
+		globalCageRow->addWidget(frontalSpin_, 1);
+		globalCageRow->addSpacing(8);
+		globalCageRow->addWidget(new QLabel(tr2("Кейдж назад:", "Cage back:")));
+		globalCageRow->addWidget(rearSpin_, 1);
+		modelsLayout_->addRow(globalCageRow);
+
+		// parts that inherit show the global number, so keep their cells in sync;
+		// parts tuned by hand are deliberately left alone
+		for (QDoubleSpinBox *spin : {frontalSpin_, rearSpin_})
+			connect(spin, &QDoubleSpinBox::valueChanged, this, [this]() { refreshMeshTree(); });
+	}
 
 	// row 5: output name (auto-suggested, user-editable)
 	nameEdit_ = new QLineEdit();
@@ -265,7 +462,7 @@ BakerWindow::BakerWindow(QWidget *parent)
 		"Заполняется по high-poly модели, можно изменить перед запеканием.",
 		"Name of the baked textures and material (<name>_alb/_sh/_n and <name>_baked.mat).\n"
 		"Auto-filled from the high-poly model, editable before baking."));
-	modelsLayout_->addRow(tr2("Имя набора:", "Output name:"), nameEdit_);
+	// added to the bottom of the window (just above Bake), not to this tab
 
 	tabs->addTab(modelsTab, tr2("Модели", "Models"));
 
@@ -280,40 +477,18 @@ BakerWindow::BakerWindow(QWidget *parent)
 	resolutionCombo_->addItem("4096", 4096);
 	resolutionCombo_->setCurrentIndex(2);
 	resolutionCombo_->setToolTip(tip2("Размер запекаемых текстур.", "Size of the baked textures."));
+	connect(resolutionCombo_, &QComboBox::currentIndexChanged, this,
+		[this](int) { updateCaptureInfo(); });
 	settingsLayout->addRow(tr2("Разрешение:", "Resolution:"), resolutionCombo_);
 
-	frontalSpin_ = new QDoubleSpinBox();
-	frontalSpin_->setDecimals(4);
-	frontalSpin_->setRange(0.0001, 100.0);
-	frontalSpin_->setSingleStep(0.01);
-	frontalSpin_->setValue(0.05);
-	frontalSpin_->setSuffix(tr2(" м", " m"));
-	frontalSpin_->setToolTip(tip2(
-		"Насколько выше поверхности low-poly искать детали high-poly.\n"
-		"Увеличивайте, чтобы захватить выступающий рельеф.",
-		"How far above the low-poly surface to search for high-poly detail.\n"
-		"Increase to capture protruding relief."));
-	settingsLayout->addRow(tr2("Дистанция вперёд:", "Frontal distance:"), frontalSpin_);
-
-	rearSpin_ = new QDoubleSpinBox();
-	rearSpin_->setDecimals(4);
-	rearSpin_->setRange(0.0, 100.0);
-	rearSpin_->setSingleStep(0.01);
-	rearSpin_->setValue(0.05);
-	rearSpin_->setSuffix(tr2(" м", " m"));
-	rearSpin_->setToolTip(tip2(
-		"Насколько ниже поверхности low-poly искать.\n"
-		"Увеличивайте, если low-poly местами выступает над high-poly.",
-		"How far below the low-poly surface to search.\n"
-		"Increase if the low-poly sticks out above the high-poly in places."));
-	settingsLayout->addRow(tr2("Дистанция назад:", "Rear distance:"), rearSpin_);
-
 	samplesCombo_ = new QComboBox();
-	samplesCombo_->addItem(tr2("1 (быстро)", "1 (fast)"), 1);
+	// no single-sample option: one ray per texel aliases every UV edge and is
+	// never the right trade-off (an old saved value of 1 simply falls back to
+	// the default, findData below returns -1 for it)
 	samplesCombo_->addItem(tr2("4 (качество)", "4 (quality)"), 4);
 	samplesCombo_->addItem(tr2("16 (высокое)", "16 (high)"), 16);
 	samplesCombo_->addItem(tr2("64 (максимум, медленно)", "64 (maximum, slow)"), 64);
-	samplesCombo_->setCurrentIndex(1);
+	samplesCombo_->setCurrentIndex(0);
 	samplesCombo_->setToolTip(tip2("Число лучей на тексель (сглаживание краёв).",
 		"Rays per texel (edge anti-aliasing)."));
 	settingsLayout->addRow(tr2("Сэмплов на тексель:", "Samples per texel:"), samplesCombo_);
@@ -354,15 +529,54 @@ BakerWindow::BakerWindow(QWidget *parent)
 	settingsLayout->addRow(QString(), skewMaskHelp_);
 	skewMaskHelp_->setVisible(skewMaskCheck_->isChecked());
 	connect(skewMaskCheck_, &QCheckBox::toggled, skewMaskHelp_, &QWidget::setVisible);
+	// the paint button only makes sense while the mask is in use
+	skewMaskButton_->setVisible(skewMaskCheck_->isChecked());
+	connect(skewMaskCheck_, &QCheckBox::toggled, skewMaskButton_, &QWidget::setVisible);
 
 	emissionCheck_ = new QCheckBox(tr2("запекать emissive (_e)", "bake emissive (_e)"));
 	emissionCheck_->setChecked(false);
 	emissionCheck_->setToolTip(tip2(
-		"Дополнительно запекает текстуру свечения (_e) и включает\n"
-		"стейт Emission у материала low-poly.",
-		"Additionally bakes the emission texture (_e) and enables\n"
-		"the Emission state on the low-poly material."));
+		"Запекает текстуру свечения (_e) и включает стейт Emission у материала low-poly.\n"
+		"RGB - цвет свечения, альфа - маска: 1 где стейт Emission включён, 0 где выключен.\n"
+		"mesh_base использует только RGB.\n",
+		"Bakes the emission texture (_e) and enables the Emission state on the low-poly material.\n"
+		"RGB = glow colour, alpha = mask: 1 where the Emission state is on, 0 where off.\n"
+		"mesh_base uses RGB only."));
 	settingsLayout->addRow(tr2("Emissive:", "Emissive:"), emissionCheck_);
+
+	decalsCheck_ = new QCheckBox(tr2("запекать декали", "bake decals"));
+	decalsCheck_->setChecked(false);
+	decalsCheck_->setToolTip(tip2(
+		"Проецирует декали сцены в запекаемые текстуры.\n"
+		"Берутся все декали из иерархии high-poly, включая вложенные в Node Reference;\n"
+		"показываются зелёной секцией списка. Выключенные декали тоже запекаются.\n",
+		"Projects the scene's decals into the baked textures.\n"
+		"Every decal in the high-poly hierarchy is taken, including ones nested in a\n"
+		"Node Reference; they are listed as the green section. Disabled decals bake too."));
+	settingsLayout->addRow(tr2("Декали:", "Decals:"), decalsCheck_);
+
+	decalDistanceSpin_ = new QDoubleSpinBox();
+	decalDistanceSpin_->setRange(0.1, 50.0);
+	decalDistanceSpin_->setValue(1.0);
+	decalDistanceSpin_->setSingleStep(0.5);
+	decalDistanceSpin_->setDecimals(1);
+	decalDistanceSpin_->setSuffix(tr2(" см", " cm"));
+	decalDistanceSpin_->setToolTip(tip2(
+		"Предел привязки screen projection декали (нода Decal Mesh), см.\n"
+		"Меньше - привязка только к ближайшей геометрии, меньше ложных проекций.\n"
+		"На DecalOrtho и DecalProj не влияет: у них своя рамка проекции.\n",
+		"Binding limit for a screen projection decal (Decal Mesh node), cm.\n"
+		"Smaller = binds only to the nearest geometry, fewer ghost projections.\n"
+		"Does not affect DecalOrtho/DecalProj: those carry their own projection box."));
+	settingsLayout->addRow(tr2("Дистанция SP-декалей:", "SP decal distance:"), decalDistanceSpin_);
+
+	// decals are gathered automatically from the high-poly hierarchy and shown
+	// as a section in the participants list; toggling just shows/hides it
+	connect(decalsCheck_, &QCheckBox::toggled, this, [this, settingsLayout](bool on) {
+		settingsLayout->setRowVisible(decalDistanceSpin_, on);
+		refreshMeshTree();
+	});
+	settingsLayout->setRowVisible(decalDistanceSpin_, false);
 
 	// --- Debug tab ---
 	auto debugTab = new QWidget();
@@ -378,17 +592,44 @@ BakerWindow::BakerWindow(QWidget *parent)
 		"masks, tiling, colors) and transfers the result onto the low-poly.\n"
 		"Disable to read only the material's base textures."));
 	debugLayout->addRow(tr2("Режим:", "Mode:"), gpuCheck_);
+	connect(gpuCheck_, &QCheckBox::toggled, this, [this](bool) { updateCaptureInfo(); });
 
 	captureUVCombo_ = new QComboBox();
 	captureUVCombo_->addItem(tr2("авто", "auto"), -1);
 	captureUVCombo_->addItem("UV0", 0);
 	captureUVCombo_->addItem("UV1", 1);
 	captureUVCombo_->setToolTip(tip2(
-		"UV-канал развёртки для GPU-захвата.\n"
-		"Авто: выбирается канал с меньшим перекрытием чартов (выбор пишется в консоль).",
-		"UV channel to unwrap into for the GPU capture.\n"
-		"Auto: the channel with less chart overlap is chosen (logged to the console)."));
+		"UV-канал для GPU-захвата.\n"
+		"Авто: канал с большей долей треугольников, получающих в атласе площадь >= 1\n"
+		"текселя; при равенстве - меньшее перекрытие чартов, затем меньше чартов.\n"
+		"Выбор пишется в консоль.\n",
+		"UV channel for the GPU capture.\n"
+		"Auto: the channel with the larger share of triangles getting >= 1 texel of\n"
+		"atlas area; ties go to less chart overlap, then fewer charts.\n"
+		"The choice is logged to the console."));
 	debugLayout->addRow(tr2("Развёртка захвата:", "Capture unwrap:"), captureUVCombo_);
+
+	captureSizeCombo_ = new QComboBox();
+	captureSizeCombo_->addItem(tr2("авто (по свободной памяти)", "auto (by free memory)"), -1);
+	captureSizeCombo_->addItem("512", 512);
+	captureSizeCombo_->addItem("1024", 1024);
+	captureSizeCombo_->addItem("2048", 2048);
+	captureSizeCombo_->setToolTip(tip2(
+		"Размер GPU-захвата на поверхность high-poly. Ограничивает детализацию режима\n"
+		"\"как в рендере\" независимо от разрешения запечки.\n"
+		"Авто: min(разрешение, 2048), но не больше sqrt(лимит / (поверхности * 13 Б)),\n"
+		"где лимит = 50% свободной ОЗУ, максимум 16 ГБ.\n"
+		"Ручной размер лимит не проверяет: при нехватке ОЗУ захваты приходят чёрными,\n"
+		"и такие поверхности печекаются из текстур материала. Расход показан внизу окна.\n",
+		"GPU capture size per high-poly surface. Caps the detail of the \"as rendered\"\n"
+		"mode regardless of the bake resolution.\n"
+		"Auto: min(resolution, 2048), limited by sqrt(budget / (surfaces * 13 B)),\n"
+		"where budget = 50% of free RAM, 16 GB max.\n"
+		"A manual size ignores the budget: if RAM runs short, captures come back black\n"
+		"and those surfaces bake from the material textures. Usage is shown at the bottom."));
+	debugLayout->addRow(tr2("Размер захвата:", "Capture size:"), captureSizeCombo_);
+	connect(captureSizeCombo_, &QComboBox::currentIndexChanged, this,
+		[this](int) { updateCaptureInfo(); });
 
 	flipYCheck_ = new QCheckBox(tr2("инвертировать G (Y)", "invert G (Y)"));
 	flipYCheck_->setChecked(false);
@@ -405,11 +646,13 @@ BakerWindow::BakerWindow(QWidget *parent)
 		"Вместо albedo запекает диагностическую раскраску:\n"
 		"зелёный — поверхность выше low-poly, синий — ниже,\n"
 		"красный — луч попал в изнанку, жёлтый — зона skew-маски,\n"
-		"чёрный/растянутый — промах.",
+		"чёрный/растянутый — промах.\n"
+		"Дополнительно сохраняет атласы GPU-захвата в %TEMP%/baker_captures.",
 		"Bakes a diagnostic colorization instead of albedo:\n"
 		"green — surface above the low-poly, blue — below,\n"
 		"red — the ray hit a back face, yellow — the skew mask area,\n"
-		"black/stretched — a miss."));
+		"black/stretched — a miss.\n"
+		"Also dumps the GPU capture atlases to %TEMP%/baker_captures."));
 	debugLayout->addRow(QString(), debugZonesCheck_);
 
 	shadingRaysCheck_ = new QCheckBox(tr2("лучи по нормалям шейдинга", "rays along shading normals"));
@@ -423,27 +666,17 @@ BakerWindow::BakerWindow(QWidget *parent)
 
 	tabs->addTab(debugTab, tr2("Отладка", "Debug"));
 
-	// the Settings rollout sits between the tabs and the Bake button
-	settingsRollout_ = new QToolButton();
-	settingsRollout_->setText(tr2("Параметры", "Settings"));
-	settingsRollout_->setCheckable(true);
-	settingsRollout_->setChecked(false);
-	settingsRollout_->setArrowType(Qt::RightArrow);
-	settingsRollout_->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-	settingsRollout_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-	// permanently highlighted (the theme's hover shade), so it never reads as disabled
-	settingsRollout_->setStyleSheet(
-		"QToolButton { background: #4a4a4a; padding: 4px; font-weight: bold; border: 1px solid #5a5a5a; border-radius: 2px; }"
-		"QToolButton:hover { background: #565656; }"
-		"QToolButton:pressed { background: #3e3e3e; }");
-	settingsPanel->setVisible(false);
-	connect(settingsRollout_, &QToolButton::toggled, settingsPanel,
-		[this, settingsPanel](bool on) {
-			settingsPanel->setVisible(on);
-			settingsRollout_->setArrowType(on ? Qt::DownArrow : Qt::RightArrow);
-		});
-	mainLayout->addWidget(settingsRollout_);
+	// the parameters are always visible now: they are few enough that hiding
+	// them behind a rollout only cost a click
 	mainLayout->addWidget(settingsPanel);
+
+	// output name, directly above the action it names
+	{
+		auto nameRow = new QHBoxLayout();
+		nameRow->addWidget(new QLabel(tr2("Имя набора:", "Output name:")));
+		nameRow->addWidget(nameEdit_, 1);
+		mainLayout->addLayout(nameRow);
+	}
 
 	// --- actions ---
 	auto buttonsRow = new QHBoxLayout();
@@ -472,17 +705,41 @@ BakerWindow::BakerWindow(QWidget *parent)
 	statusLabel_->setWordWrap(true);
 	mainLayout->addWidget(statusLabel_);
 
-	mainLayout->addStretch(1);
+	// what the GPU capture will actually cost: it is the real limit on "as
+	// rendered" detail, and it changes with the model and the free memory
+	captureInfoLabel_ = new QLabel();
+	captureInfoLabel_->setWordWrap(true);
+	captureInfoLabel_->setStyleSheet("color: #9a9a9a;");
+	captureInfoLabel_->setToolTip(tip2(
+		"Размер GPU-захвата на поверхность и расход ОЗУ.\n"
+		"Меняется в Отладка > Размер захвата.\n",
+		"GPU capture size per surface and its RAM usage.\n"
+		"Change it in Debug > Capture size."));
+	mainLayout->addWidget(captureInfoLabel_);
 
-	// author credit
+	// no filler stretch here: the spare space goes to the tabs (and through them
+	// to the participants list) instead of being wasted above the credit line
+
+	// author credit + version. BAKER_VERSION is parsed out of Baker.json by
+	// CMake, so the window can never show a version the manifest disagrees with.
+#ifndef BAKER_VERSION
+#define BAKER_VERSION "dev"
+#endif
+	const QString fullVersion = QString::fromLatin1(BAKER_VERSION);
+	// the manifest carries the 4-part Qt plugin form ("0.5.0.0"); show major.minor
+	const QString shortVersion = fullVersion.count('.') >= 1
+		? fullVersion.section('.', 0, 1)
+		: fullVersion;
 	auto aboutLabel = new QLabel(
-		"<span style=\"color:#9a9a9a;\">Texture Baker by zloy_pingvin</span>&nbsp;&nbsp;"
+		QString("<span style=\"color:#9a9a9a;\">Texture Baker v%1 by zloy_pingvin</span>&nbsp;&nbsp;")
+			.arg(shortVersion) +
 		"<a href=\"https://github.com/zloy-pingvin/unigine-texture-baker\" "
 		"style=\"color:#7aa7cc; text-decoration:none;\">GitHub</a>&nbsp;&middot;&nbsp;"
 		"<a href=\"https://t.me/zloytux\" "
 		"style=\"color:#7aa7cc; text-decoration:none;\">Telegram</a>");
 	aboutLabel->setOpenExternalLinks(true);
 	aboutLabel->setAlignment(Qt::AlignRight);
+	aboutLabel->setToolTip(tip2("Версия плагина: %1", "Plugin version: %1").arg(fullVersion));
 	mainLayout->addWidget(aboutLabel);
 
 	captureTimer_ = new QTimer(this);
@@ -515,10 +772,14 @@ void BakerWindow::saveSettings() const
 	s.setValue("samples", samplesCombo_->currentData().toInt());
 	s.setValue("use_skew_mask", skewMaskCheck_->isChecked());
 	s.setValue("bake_emission", emissionCheck_->isChecked());
+	s.setValue("bake_decals", decalsCheck_->isChecked());
+	s.setValue("decal_distance", decalDistanceSpin_->value());
 	s.setValue("groups_mode", groupsModeCombo_->currentData().toInt());
-	s.setValue("settings_expanded", settingsRollout_->isChecked());
 	s.setValue("gpu_mode", gpuCheck_->isChecked());
 	s.setValue("capture_uv", captureUVCombo_->currentData().toInt());
+	s.setValue("capture_size", captureSizeCombo_->currentData().toInt());
+	s.setValue("collapsed_sections",
+		QStringList(collapsedSections_.begin(), collapsedSections_.end()).join(','));
 	s.setValue("flip_y", flipYCheck_->isChecked());
 	s.setValue("shading_rays", shadingRaysCheck_->isChecked());
 }
@@ -536,6 +797,8 @@ void BakerWindow::restoreSettings()
 		samplesCombo_->setCurrentIndex(idx);
 	skewMaskCheck_->setChecked(s.value("use_skew_mask", true).toBool());
 	emissionCheck_->setChecked(s.value("bake_emission", false).toBool());
+	decalsCheck_->setChecked(s.value("bake_decals", false).toBool());
+	decalDistanceSpin_->setValue(s.value("decal_distance", 1.0).toDouble());
 	// manual groups are not persisted (node IDs are not stable across sessions),
 	// so restore the manual mode as "off"
 	int gm = s.value("groups_mode", 0).toInt();
@@ -544,11 +807,17 @@ void BakerWindow::restoreSettings()
 	idx = groupsModeCombo_->findData(gm);
 	if (idx >= 0)
 		groupsModeCombo_->setCurrentIndex(idx);
-	settingsRollout_->setChecked(s.value("settings_expanded", false).toBool());
 	gpuCheck_->setChecked(s.value("gpu_mode", true).toBool());
 	idx = captureUVCombo_->findData(s.value("capture_uv", -1).toInt());
 	if (idx >= 0)
 		captureUVCombo_->setCurrentIndex(idx);
+	idx = captureSizeCombo_->findData(s.value("capture_size", -1).toInt());
+	if (idx >= 0)
+		captureSizeCombo_->setCurrentIndex(idx);
+	collapsedSections_.clear();
+	for (const QString &key :
+		s.value("collapsed_sections").toString().split(',', Qt::SkipEmptyParts))
+		collapsedSections_.insert(key);
 	flipYCheck_->setChecked(s.value("flip_y", false).toBool());
 	shadingRaysCheck_->setChecked(s.value("shading_rays", false).toBool());
 }
@@ -604,6 +873,30 @@ void BakerWindow::addSlotNodes(bool high, const std::vector<int> &rootIds)
 			"No Static Meshes added (none in the node or already listed)."));
 		return;
 	}
+
+	// decals live in the same instance hierarchy as the high-poly — gather them
+	// automatically so they show in the list and get baked (correct positions)
+	if (high)
+		for (int rootId : rootIds)
+		{
+			std::function<void(const NodePtr &)> walk = [&](const NodePtr &n) {
+				if (!n)
+					return;
+				if (n->isDecal())
+				{
+					int id = n->getID();
+					if (std::find(decalIds_.begin(), decalIds_.end(), id) == decalIds_.end())
+						decalIds_.push_back(id);
+				}
+				for (int i = 0; i < n->getNumChildren(); i++)
+					walk(n->getChild(i));
+				// descend into node reference contents (decals nested in a prefab)
+				if (n->getType() == Node::NODE_REFERENCE)
+					if (Ptr<NodeReference> nr = checked_ptr_cast<NodeReference>(n))
+						walk(nr->getReference());
+			};
+			walk(World::getNodeByID(rootId));
+		}
 	// newly added meshes follow the slot's current visibility toggle
 	if ((high ? highHideButton_ : lowHideButton_)->isChecked())
 		setSlotHidden(high, true);
@@ -615,6 +908,79 @@ void BakerWindow::addSlotNodes(bool high, const std::vector<int> &rootIds)
 	setUiLocked(baking_);
 }
 
+void BakerWindow::forEachHighHierarchyNode(const std::function<void(const NodePtr &)> &fn) const
+{
+	if (!fn)
+		return;
+	std::set<int> visited;
+	std::vector<NodePtr> stack;
+	for (int id : highIds_)
+		if (NodePtr n = World::getNodeByID(id))
+		{
+			NodePtr top = n;
+			while (top && top->getParent())
+				top = top->getParent();
+			if (top)
+				stack.push_back(top);
+		}
+	while (!stack.empty())
+	{
+		NodePtr n = stack.back();
+		stack.pop_back();
+		if (!n || !visited.insert(n->getID()).second)
+			continue;
+		for (int i = 0; i < n->getNumChildren(); i++)
+			stack.push_back(n->getChild(i));
+		if (n->getType() == Node::NODE_REFERENCE)
+			if (Ptr<NodeReference> nr = checked_ptr_cast<NodeReference>(n))
+				stack.push_back(nr->getReference());
+		fn(n);
+	}
+}
+
+void BakerWindow::forEachHighDecal(
+	const std::function<void(const NodePtr &, const NodePtr &)> &fn) const
+{
+	if (decalIds_.empty() || !fn)
+		return;
+	const std::set<int> wanted(decalIds_.begin(), decalIds_.end());
+	std::set<int> visited;
+	// each entry carries the Node Reference it was reached through (null = none)
+	struct Entry
+	{
+		NodePtr node;
+		NodePtr enclosingRef;
+	};
+	std::vector<Entry> stack;
+	// start from the top ancestors, exactly like the gather and the bake do
+	for (int id : highIds_)
+		if (NodePtr n = World::getNodeByID(id))
+		{
+			NodePtr top = n;
+			while (top && top->getParent())
+				top = top->getParent();
+			if (top)
+				stack.push_back({top, NodePtr()});
+		}
+	while (!stack.empty())
+	{
+		const Entry e = stack.back();
+		stack.pop_back();
+		const NodePtr &n = e.node;
+		if (!n || !visited.insert(n->getID()).second)
+			continue;
+		for (int i = 0; i < n->getNumChildren(); i++)
+			stack.push_back({n->getChild(i), e.enclosingRef});
+		// the whole point: descend into node reference contents, remembering
+		// which reference we entered
+		if (n->getType() == Node::NODE_REFERENCE)
+			if (Ptr<NodeReference> nr = checked_ptr_cast<NodeReference>(n))
+				stack.push_back({nr->getReference(), n});
+		if (n->isDecal() && wanted.count(n->getID()))
+			fn(n, e.enclosingRef);
+	}
+}
+
 // Viewport-only visibility of the slot meshes; baking ignores it
 // (collectMeshes includes disabled nodes on purpose).
 void BakerWindow::setSlotHidden(bool high, bool hidden)
@@ -622,6 +988,45 @@ void BakerWindow::setSlotHidden(bool high, bool hidden)
 	for (int id : (high ? highIds_ : lowIds_))
 		if (NodePtr node = World::getNodeByID(id))
 			node->setEnabled(!hidden);
+	// decals are gathered FROM the high-poly hierarchy, so they belong to that
+	// slot: hiding the meshes while their stickers stay floating in the viewport
+	// is not what "hide the high-poly" means
+	if (high)
+	{
+		// A decal INSIDE a Node Reference keeps rendering even after its own
+		// enabled flag is cleared (verified: the flag takes, the decal stays
+		// visible) — the engine draws the reference's content as a unit. So the
+		// reference itself has to be toggled, which also hides the rest of that
+		// prefab: correct for a "hide the high-poly" switch, since the prefab is
+		// part of the same high-poly assembly.
+		const std::set<int> listedDecals(decalIds_.begin(), decalIds_.end());
+		std::vector<NodePtr> refs;
+		QStringList unlisted;
+		forEachHighHierarchyNode([&](const NodePtr &n) {
+			if (n->isDecal())
+			{
+				n->setEnabled(!hidden);
+				// a decal in the hierarchy that never made it into the list would
+				// also never be baked — worth naming rather than silently missing
+				if (!listedDecals.count(n->getID()))
+					unlisted << QString::fromUtf8(n->getName());
+			}
+			// EVERY reference in the hierarchy, not just ones holding decals:
+			// prefabs carry meshes too (indicators, screens), and their content
+			// is equally unreachable node-by-node
+			if (n->getType() == Node::NODE_REFERENCE)
+				refs.push_back(n);
+		});
+		for (const NodePtr &r : refs)
+			r->setEnabled(!hidden);
+		Unigine::Log::message("Baker: hide high-poly %s: %d node reference(s) toggled as a whole "
+							  "(their content cannot be hidden node by node)\n",
+			hidden ? "on" : "off", int(refs.size()));
+		if (!unlisted.isEmpty())
+			Unigine::Log::warning("Baker: decals in the high-poly hierarchy that are NOT in the "
+								  "participants list (they would not be baked either): %s\n",
+				unlisted.join(", ").toUtf8().constData());
+	}
 	QPushButton *btn = high ? highHideButton_ : lowHideButton_;
 	btn->setText(hidden ? tr2("Показать", "Show") : tr2("Скрыть", "Hide"));
 }
@@ -634,7 +1039,12 @@ void BakerWindow::clearSlot(bool high)
 		hideBtn->setChecked(false);
 	(high ? highIds_ : lowIds_).clear();
 	if (high)
+	{
+		decalIds_.clear(); // decals were gathered from the high-poly
 		updateSuggestedName();
+	}
+	else
+		partCage_.clear(); // the per-part cage belonged to those low-poly parts
 	updateSlotLabels();
 	refreshMeshTree();
 	setUiLocked(baking_);
@@ -659,48 +1069,138 @@ void BakerWindow::updateSlotLabels()
 // Rebuilds the striped participants list: a High-poly section with dark rows
 // and a Low-poly section with lighter rows (like the World Nodes hierarchy).
 // Column 1 holds the per-mesh remove button (✕).
+void BakerWindow::fillCageCells(QTreeWidgetItem *item, int nodeId)
+{
+	if (!item || !frontalSpin_ || !rearSpin_)
+		return;
+	auto it = partCage_.find(nodeId);
+	const PartCage pc = it != partCage_.end() ? it->second : PartCage();
+	for (int c = 1; c <= 2; c++)
+	{
+		const bool isFront = c == 1;
+		const bool explicitAxis = isFront ? pc.hasFrontal : pc.hasRear;
+		const float value = explicitAxis
+			? (isFront ? pc.frontal : pc.rear)
+			: float(isFront ? frontalSpin_->value() : rearSpin_->value());
+		item->setText(c, QString::number(value, 'f', 3));
+		// dim = follows the global setting, bright = set by hand for this part
+		item->setForeground(c, explicitAxis ? QColor(0xe0, 0xe0, 0xe0) : QColor(0x82, 0x82, 0x82));
+		item->setTextAlignment(c, Qt::AlignRight | Qt::AlignVCenter);
+		item->setToolTip(c,
+			explicitAxis
+				? tip2("Задано для этой детали. Очистите поле, чтобы вернуть общее значение.",
+					  "Set for this part. Clear the field to return to the global value.")
+				: tip2("Следует за общей настройкой. Впишите своё значение (в метрах).",
+					  "Follows the global setting. Type your own value (in meters)."));
+	}
+}
+
 void BakerWindow::refreshMeshTree()
 {
 	if (!meshTree_)
 		return;
+	treeUpdating_ = true;
 	meshTree_->clear();
 
-	const QColor headerBg(0x33, 0x33, 0x33);
-	const QColor highBg(0x26, 0x26, 0x26);
-	const QColor lowBg(0x42, 0x42, 0x42);
+	// each role gets its own hue so the three sections are told apart at a
+	// glance: blue = source, amber = target, green = decals. Kept dark and
+	// low-saturation to sit in the editor's theme.
+	const QColor highBg(0x25, 0x2e, 0x3d);  // blue
+	const QColor lowBg(0x43, 0x38, 0x41);   // mauve
+	const QColor decalBg(0x2e, 0x3a, 0x2e); // green
+	// section header: the row colour, a shade deeper
+	auto headerOf = [](const QColor &c) { return c.darker(135); };
 
-	auto addSection = [this, &headerBg](const QString &title, const std::vector<int> &ids, const QColor &rowBg) {
+	// removable = the row's ✕ takes the mesh out of the slot. Group sections are
+	// defined by their root node, so individual meshes cannot be dropped there.
+	auto addSection = [this, &headerOf](const QString &title, const std::vector<int> &ids,
+							const QColor &rowBg, bool cage, const QString &key, bool removable) {
+		const QColor headerBg = headerOf(rowBg);
 		auto top = new QTreeWidgetItem(meshTree_, {title});
+		top->setData(0, Qt::UserRole, key); // fold state is remembered by key
 		QFont f = top->font(0);
 		f.setBold(true);
 		top->setFont(0, f);
-		top->setBackground(0, headerBg);
-		top->setBackground(1, headerBg);
+		// the section header doubles as the column caption for the cage columns
+		if (cage)
+		{
+			top->setText(1, tr2("вперёд", "front"));
+			top->setText(2, tr2("назад", "back"));
+			for (int c = 1; c <= 2; c++)
+			{
+				top->setFont(c, f);
+				top->setTextAlignment(c, Qt::AlignRight | Qt::AlignVCenter);
+				top->setToolTip(c, tip2("Кейдж этой детали, в метрах.", "This part's cage, in meters."));
+			}
+		}
+		for (int c = 0; c < 4; c++)
+			top->setBackground(c, headerBg);
 		top->setFlags(top->flags() & ~Qt::ItemIsSelectable);
 		for (int id : ids)
 		{
 			NodePtr node = World::getNodeByID(id);
 			if (!node)
 				continue;
-			auto item = new QTreeWidgetItem(top, {QString::fromUtf8(node->getName()), "✕"});
-			item->setBackground(0, rowBg);
-			item->setBackground(1, rowBg);
-			item->setTextAlignment(1, Qt::AlignCenter);
-			item->setForeground(1, QColor(0xa0, 0xa0, 0xa0));
+			auto item = new QTreeWidgetItem(top, {QString::fromUtf8(node->getName())});
+			for (int c = 0; c < 4; c++)
+				item->setBackground(c, rowBg);
 			item->setData(0, Qt::UserRole, id);
-			item->setToolTip(1, tip2("Убрать из списка.", "Remove from the list."));
+			if (removable)
+			{
+				item->setText(3, "✕");
+				item->setTextAlignment(3, Qt::AlignCenter);
+				item->setForeground(3, QColor(0xa0, 0xa0, 0xa0));
+				item->setToolTip(3, tip2("Убрать из списка.", "Remove from the list."));
+			}
+			if (cage)
+			{
+				item->setFlags(item->flags() | Qt::ItemIsEditable);
+				fillCageCells(item, id);
+			}
 		}
 		if (top->childCount() == 0)
 		{
 			auto item = new QTreeWidgetItem(top, {tr2("<не выбрано>", "<not set>")});
-			item->setBackground(0, rowBg);
-			item->setBackground(1, rowBg);
+			for (int c = 0; c < 4; c++)
+				item->setBackground(c, rowBg);
 			item->setForeground(0, QColor(0x80, 0x80, 0x80));
 		}
+		top->setExpanded(!collapsedSections_.count(key));
 	};
-	addSection(tr2("High-poly (источник)", "High-poly (source)"), highIds_, highBg);
-	addSection(tr2("Low-poly (цель)", "Low-poly (target)"), lowIds_, lowBg);
-	meshTree_->expandAll();
+
+	if (manualGroups())
+	{
+		// same list, one pair of sections per group: the cage columns, the colours
+		// and the folding all work exactly as in single mode
+		for (size_t i = 0; i < groupRows_.size(); i++)
+		{
+			const GroupRow &g = groupRows_[i];
+			std::vector<int> gHigh, gLow;
+			for (const auto &m : BakeCore::collectMeshes(World::getNodeByID(g.highId)))
+				gHigh.push_back(m->getID());
+			for (const auto &m : BakeCore::collectMeshes(World::getNodeByID(g.lowId)))
+				gLow.push_back(m->getID());
+			addSection(tr2("Группа %1 · high-poly", "Group %1 · high-poly").arg(i + 1), gHigh,
+				highBg, false, QString("g%1hi").arg(i), false);
+			addSection(tr2("Группа %1 · low-poly", "Group %1 · low-poly").arg(i + 1), gLow, lowBg,
+				true, QString("g%1lo").arg(i), false);
+		}
+	}
+	else
+	{
+		addSection(tr2("High-poly (источник)", "High-poly (source)"), highIds_, highBg, false,
+			"high", true);
+		// the cage offsets the ray ORIGIN from the low-poly surface, so it is a
+		// property of the low-poly part — that is the only section carrying it
+		addSection(tr2("Low-poly (цель)", "Low-poly (target)"), lowIds_, lowBg, true, "low", true);
+		if (decalsCheck_ && decalsCheck_->isChecked())
+			addSection(tr2("Декали (из high-poly)", "Decals (from high-poly)"), decalIds_, decalBg,
+				false, "decals", true);
+	}
+	treeUpdating_ = false;
+	if (resetCageButton_)
+		resetCageButton_->setEnabled(!partCage_.empty());
+	updateCaptureInfo();
 }
 
 void BakerWindow::updateSuggestedName()
@@ -832,21 +1332,39 @@ void BakerWindow::addGroupRow()
 		return btn;
 	};
 
+	// viewport-only toggle: the group's slot is a root node, so disabling that
+	// node hides its whole subtree — node references included
+	const QString hideTipGroup = tip2(
+		"Скрыть/показать ноду слота во вьюпорте вместе со всем её содержимым.\n"
+		"На запекание не влияет.",
+		"Hide/show the slot node in the viewport with its whole subtree.\n"
+		"Does not affect baking.");
+	auto makeHideBtn = [&hideTipGroup, this]() {
+		auto btn = new QPushButton(tr2("Скрыть", "Hide"));
+		btn->setCheckable(true);
+		btn->setToolTip(hideTipGroup);
+		return btn;
+	};
+
 	gr.highLabel = new QLabel(notSet);
 	auto highBtn = new QPushButton(pickText);
+	gr.hideHighButton = makeHideBtn();
 	auto highClear = makeClearButton();
 	auto highRow = new QHBoxLayout();
 	highRow->addWidget(gr.highLabel, 1);
 	highRow->addWidget(highBtn);
+	highRow->addWidget(gr.hideHighButton);
 	highRow->addWidget(highClear);
 	form->addRow("High:", highRow);
 
 	gr.lowLabel = new QLabel(notSet);
 	auto lowBtn = new QPushButton(pickText);
+	gr.hideLowButton = makeHideBtn();
 	auto lowClear = makeClearButton();
 	auto lowRow = new QHBoxLayout();
 	lowRow->addWidget(gr.lowLabel, 1);
 	lowRow->addWidget(lowBtn);
+	lowRow->addWidget(gr.hideLowButton);
 	lowRow->addWidget(lowClear);
 	form->addRow("Low:", lowRow);
 
@@ -854,6 +1372,17 @@ void BakerWindow::addGroupRow()
 	form->addRow(QString(), removeBtn);
 
 	QGroupBox *boxPtr = gr.box;
+	for (int slot = 0; slot < 2; slot++)
+	{
+		QPushButton *btn = slot == 0 ? gr.hideHighButton : gr.hideLowButton;
+		connect(btn, &QPushButton::toggled, this, [this, boxPtr, slot, btn](bool on) {
+			for (const GroupRow &g : groupRows_)
+				if (g.box == boxPtr)
+					if (NodePtr node = World::getNodeByID(slot == 0 ? g.highId : g.lowId))
+						node->setEnabled(!on);
+			btn->setText(on ? tr2("Показать", "Show") : tr2("Скрыть", "Hide"));
+		});
+	}
 	connect(highBtn, &QPushButton::clicked, this, [this, boxPtr]() {
 		for (GroupRow &g : groupRows_)
 			if (g.box == boxPtr)
@@ -864,6 +1393,7 @@ void BakerWindow::addGroupRow()
 				break;
 			}
 		updateSuggestedName();
+		refreshMeshTree();
 		setUiLocked(baking_);
 	});
 	connect(lowBtn, &QPushButton::clicked, this, [this, boxPtr]() {
@@ -875,6 +1405,7 @@ void BakerWindow::addGroupRow()
 					g.lowId = id;
 				break;
 			}
+		refreshMeshTree();
 		setUiLocked(baking_);
 	});
 	connect(highClear, &QPushButton::clicked, this, [this, boxPtr, notSet]() {
@@ -886,6 +1417,7 @@ void BakerWindow::addGroupRow()
 				break;
 			}
 		updateSuggestedName();
+		refreshMeshTree();
 		setUiLocked(baking_);
 	});
 	connect(lowClear, &QPushButton::clicked, this, [this, boxPtr, notSet]() {
@@ -896,6 +1428,7 @@ void BakerWindow::addGroupRow()
 				g.lowLabel->setText(notSet);
 				break;
 			}
+		refreshMeshTree();
 		setUiLocked(baking_);
 	});
 	connect(removeBtn, &QPushButton::clicked, this, [this, boxPtr]() { removeGroupRow(boxPtr); });
@@ -904,6 +1437,7 @@ void BakerWindow::addGroupRow()
 	groupsLayout_->insertWidget(groupsLayout_->count() - 1, gr.box);
 	groupRows_.push_back(gr);
 	renumberGroups();
+	refreshMeshTree();
 	setUiLocked(baking_);
 }
 
@@ -917,6 +1451,7 @@ void BakerWindow::removeGroupRow(QGroupBox *box)
 			break;
 		}
 	renumberGroups();
+	refreshMeshTree();
 	setUiLocked(baking_);
 }
 
@@ -942,7 +1477,7 @@ void BakerWindow::updateModelsMode()
 	modelsLayout_->setRowVisible(0, !manual); // single-mode high row
 	modelsLayout_->setRowVisible(1, !manual); // single-mode low row
 	modelsLayout_->setRowVisible(3, manual);  // manual groups panel
-	modelsLayout_->setRowVisible(4, !manual); // participants list
+	modelsLayout_->setRowVisible(4, true);    // participants list (both modes)
 	if (manual && groupRows_.empty())
 		addGroupRow();
 	updateSuggestedName();
@@ -1004,7 +1539,15 @@ void BakerWindow::setUiLocked(bool locked)
 	shadingRaysCheck_->setEnabled(!locked);
 	skewMaskCheck_->setEnabled(!locked);
 	emissionCheck_->setEnabled(!locked);
+	decalsCheck_->setEnabled(!locked);
+	decalDistanceSpin_->setEnabled(!locked);
 	skewMaskButton_->setEnabled(!locked && firstLowId() != 0);
+	if (autoCageButton_)
+		autoCageButton_->setEnabled(!locked && firstLowId() != 0);
+	if (resetCageButton_)
+		resetCageButton_->setEnabled(!locked && !partCage_.empty());
+	if (meshTree_)
+		meshTree_->setEnabled(!locked);
 	bool modelsReady;
 	if (manualGroups())
 	{
@@ -1184,6 +1727,232 @@ void BakerWindow::onCreateSkewMask()
 			.arg(QString::fromUtf8(virtualPath.get())));
 }
 
+std::vector<BakeCore::BakeGroup> BakerWindow::buildProbeGroups() const
+{
+	std::vector<BakeCore::BakeGroup> groups;
+	if (manualGroups())
+	{
+		// each row is already an explicit high/low pair
+		for (const GroupRow &row : groupRows_)
+		{
+			BakeCore::BakeGroup g;
+			g.highs = BakeCore::collectMeshes(World::getNodeByID(row.highId));
+			g.lows = BakeCore::collectMeshes(World::getNodeByID(row.lowId));
+			if (!g.highs.empty() && !g.lows.empty())
+				groups.push_back(std::move(g));
+		}
+		return groups;
+	}
+	// single pair (and name groups: probing against the whole high-poly set only
+	// risks a slightly smaller cage, and the nearest hit is the part's own
+	// geometry anyway)
+	BakeCore::BakeGroup g;
+	for (int id : highIds_)
+		if (Ptr<ObjectMeshStatic> mesh = checked_ptr_cast<ObjectMeshStatic>(World::getNodeByID(id)))
+			g.highs.push_back(mesh);
+	for (int id : lowIds_)
+		if (Ptr<ObjectMeshStatic> mesh = checked_ptr_cast<ObjectMeshStatic>(World::getNodeByID(id)))
+			g.lows.push_back(mesh);
+	if (!g.highs.empty() && !g.lows.empty())
+		groups.push_back(std::move(g));
+	return groups;
+}
+
+int BakerWindow::estimateCaptureSurfaces() const
+{
+	int n = 0;
+	for (const BakeCore::BakeGroup &g : buildProbeGroups())
+		for (const auto &high : g.highs)
+		{
+			Ptr<ConstMesh> mesh = high->getMeshForceRAM();
+			if (!mesh)
+				continue;
+			for (int s = 0; s < mesh->getNumSurfaces(); s++)
+			{
+				if (!BakeCore::isSurfaceBakeable(high, s))
+					continue;
+				if (mesh->getNumTexCoords0(s) <= 0)
+					continue;
+				n++;
+			}
+		}
+	return n;
+}
+
+int BakerWindow::computeCaptureSize(int surfaceCount, double *outFreeBytes,
+	double *outBudgetBytes, bool *outManual) const
+{
+	// per surface and per texel: 3 RGBA8 gbuffer images + 1 coverage byte
+	const double bytesPerTexel = 3.0 * 4.0 + 1.0;
+	const double freeBytes = availablePhysicalMemory();
+	if (outFreeBytes)
+		*outFreeBytes = freeBytes;
+
+	int size = resolutionCombo_ ? resolutionCombo_->currentData().toInt() : 2048;
+	size = size < 512 ? 512 : (size > 2048 ? 2048 : size);
+
+	const int forced = captureSizeCombo_ ? captureSizeCombo_->currentData().toInt() : -1;
+	if (outManual)
+		*outManual = forced > 0;
+	if (forced > 0)
+	{
+		if (outBudgetBytes)
+			*outBudgetBytes = 0.0;
+		return forced;
+	}
+
+	// Budget the capture set against what the machine can actually give. A fixed
+	// constant is wrong in both directions: it wastes resolution on a big box and
+	// thrashes on a small one. Half of the free physical memory leaves room for
+	// the bake accumulators, the output images and the editor itself.
+	double budget = freeBytes > 0.0 ? freeBytes * 0.5 : 1.5e9;
+	budget = qBound(1.0e9, budget, 16.0e9);
+	if (outBudgetBytes)
+		*outBudgetBytes = budget;
+	if (surfaceCount > 0)
+	{
+		const int maxSize = int(std::sqrt(budget / (double(surfaceCount) * bytesPerTexel)));
+		if (maxSize < size)
+			size = maxSize < 256 ? 256 : maxSize;
+	}
+	return size;
+}
+
+void BakerWindow::updateCaptureInfo()
+{
+	if (!captureInfoLabel_)
+		return;
+	// nothing is captured in CPU mode, so the line has nothing to say: hide it
+	// instead of leaving a dead row in the window
+	if (gpuCheck_ && !gpuCheck_->isChecked())
+	{
+		captureInfoLabel_->setVisible(false);
+		return;
+	}
+	captureInfoLabel_->setVisible(true);
+	const int n = estimateCaptureSurfaces();
+	if (n <= 0)
+	{
+		captureInfoLabel_->setText(
+			tr2("Захват: модели не выбраны.", "Capture: no models set."));
+		return;
+	}
+	double freeBytes = 0.0, budget = 0.0;
+	bool manual = false;
+	const int size = computeCaptureSize(n, &freeBytes, &budget, &manual);
+	const double useGb = double(n) * double(size) * double(size) * 13.0 / 1e9;
+	captureInfoLabel_->setText(
+		tr2("Захват: %1×%1 на поверхность × %2 поверхн. ≈ %3 ГБ ОЗУ (%4, свободно %5 ГБ)",
+			"Capture: %1x%1 per surface x %2 surfaces = %3 GB RAM (%4, %5 GB free)")
+			.arg(size)
+			.arg(n)
+			.arg(useGb, 0, 'f', 1)
+			.arg(manual ? tr2("вручную", "manual") : tr2("авто", "auto"))
+			.arg(freeBytes / 1e9, 0, 'f', 1));
+}
+
+void BakerWindow::resetAllPartCage()
+{
+	if (partCage_.empty())
+		return;
+	partCage_.clear();
+	refreshMeshTree();
+	statusLabel_->setText(tr2("Индивидуальные дистанции сброшены — все детали следуют общим настройкам.",
+		"Per-part distances cleared - every part follows the global settings again."));
+}
+
+void BakerWindow::onAutoCage()
+{
+	if (baking_)
+		return;
+	std::vector<BakeCore::BakeGroup> groups = buildProbeGroups();
+	if (groups.empty())
+	{
+		statusLabel_->setText(tr2("Сначала выберите high-poly и low-poly модели.",
+			"Set the high-poly and low-poly models first."));
+		return;
+	}
+
+	setUiLocked(true);
+	statusLabel_->setText(tr2("Промер кейджа...", "Probing the cage..."));
+	QCoreApplication::processEvents();
+
+	auto progress = [this](int percent, const char *text) -> bool {
+		progressBar_->setValue(percent);
+		statusLabel_->setText(QString::fromUtf8(text));
+		QCoreApplication::processEvents();
+		return true;
+	};
+	// look no further than a generous slice of the model: a probe that reaches
+	// across the whole scene would just latch onto unrelated geometry
+	float maxProbe = 0.5f;
+	{
+		using namespace Unigine::Math;
+		vec3 mn(1e9f, 1e9f, 1e9f), mx(-1e9f, -1e9f, -1e9f);
+		bool any = false;
+		for (const BakeCore::BakeGroup &g : groups)
+			for (const auto &low : g.lows)
+			{
+				const auto bb = low->getWorldBoundBox();
+				mn = min(mn, vec3(bb.minimum));
+				mx = max(mx, vec3(bb.maximum));
+				any = true;
+			}
+		if (any)
+			maxProbe = clamp(length(mx - mn) * 0.1f, 0.02f, 2.0f);
+	}
+
+	const std::map<int, Unigine::Math::vec2> probed =
+		BakeCore::suggestPartCage(groups, maxProbe, progress);
+
+	progressBar_->setValue(0);
+	setUiLocked(false);
+	if (probed.empty())
+	{
+		statusLabel_->setText(tr2("Промер не нашёл high-poly под деталями — дистанции не изменены.",
+			"The probe found no high-poly under the parts - distances left unchanged."));
+		return;
+	}
+	// The global pair is the CEILING: fitting may only tighten a part, never
+	// grant it a bigger cage than the one already accepted globally. An axis the
+	// probe wants wider is left inherited, so it keeps following the global value.
+	const float gFront = float(frontalSpin_->value());
+	const float gRear = float(rearSpin_->value());
+	int tightened = 0, atCeiling = 0;
+	for (const auto &entry : probed)
+	{
+		PartCage pc = partCage_.count(entry.first) ? partCage_[entry.first] : PartCage();
+		bool changed = false;
+		if (entry.second.x < gFront)
+		{
+			pc.hasFrontal = true;
+			pc.frontal = entry.second.x;
+			changed = true;
+		}
+		else
+			pc.hasFrontal = false;
+		if (entry.second.y < gRear)
+		{
+			pc.hasRear = true;
+			pc.rear = entry.second.y;
+			changed = true;
+		}
+		else
+			pc.hasRear = false;
+		if (pc.any())
+			partCage_[entry.first] = pc;
+		else
+			partCage_.erase(entry.first);
+		changed ? tightened++ : atCeiling++;
+	}
+	refreshMeshTree();
+	statusLabel_->setText(
+		tr2("Кейдж поджат у %1 детал(и/ей), %2 остались на общем значении (оно потолок).",
+			"Cage tightened on %1 part(s), %2 stay at the global value (it is the ceiling).")
+			.arg(tightened)
+			.arg(atCeiling));
+}
+
 void BakerWindow::startBake()
 {
 	if (baking_)
@@ -1311,6 +2080,20 @@ void BakerWindow::startBake()
 	settings_.resolution = resolutionCombo_->currentData().toInt();
 	settings_.frontalDistance = float(frontalSpin_->value());
 	settings_.rearDistance = float(rearSpin_->value());
+	// resolve per-axis inheritance into the concrete pairs the core expects
+	settings_.partCage.clear();
+	for (const auto &entry : partCage_)
+	{
+		const PartCage &pc = entry.second;
+		const Unigine::Math::vec2 v(
+			pc.hasFrontal ? pc.frontal : settings_.frontalDistance,
+			pc.hasRear ? pc.rear : settings_.rearDistance);
+		settings_.partCage[entry.first] = v;
+		if (NodePtr node = World::getNodeByID(entry.first))
+			Unigine::Log::message("Baker: part cage \"%s\": frontal=%.4f%s rear=%.4f%s\n",
+				node->getName(), v.x, pc.hasFrontal ? "" : " (global)", v.y,
+				pc.hasRear ? "" : " (global)");
+	}
 	settings_.supersamples = samplesCombo_->currentData().toInt();
 	settings_.flipNormalY = flipYCheck_->isChecked();
 	settings_.gpuMode = gpuCheck_->isChecked();
@@ -1319,6 +2102,9 @@ void BakerWindow::startBake()
 	settings_.raysAlongShading = shadingRaysCheck_->isChecked();
 	settings_.useSkewMask = skewMaskCheck_->isChecked();
 	settings_.bakeEmission = emissionCheck_->isChecked();
+	settings_.bakeDecals = decalsCheck_->isChecked();
+	settings_.decalNodeIds = decalsCheck_->isChecked() ? decalIds_ : std::vector<int>();
+	settings_.decalDistance = float(decalDistanceSpin_->value()) * 0.01f; // cm -> m
 	settings_.outputName = nameEdit_->text().trimmed().toUtf8().constData();
 
 	baking_ = true;
@@ -1357,8 +2143,23 @@ void BakerWindow::startBake()
 		}
 		if (!captureItems_.empty())
 		{
-			captureSize_ = settings_.resolution;
-			captureSize_ = captureSize_ < 512 ? 512 : (captureSize_ > 2048 ? 2048 : captureSize_);
+			// Every captured surface holds 3 images (albedo/shading/normal) at
+			// captureSize² AND a GPU texture set of the same size in flight, so
+			// the size is budgeted against free RAM (or forced in the Debug tab).
+			// One shared policy with the label under the window, so what the user
+			// reads there is exactly what the bake uses.
+			{
+				const int n = int(captureItems_.size());
+				double freeBytes = 0.0, budgetBytes = 0.0;
+				bool manual = false;
+				captureSize_ = computeCaptureSize(n, &freeBytes, &budgetBytes, &manual);
+				Unigine::Log::message(
+					"Baker: %d surfaces to capture, capture size = %d (%s, free RAM %.1f GB, "
+					"budget %.1f GB, estimated capture set %.1f GB)\n",
+					n, captureSize_, manual ? "manual" : "auto", freeBytes / 1e9,
+					budgetBytes / 1e9,
+					double(n) * double(captureSize_) * double(captureSize_) * 13.0 / 1e9);
+			}
 			captureStarted_ = false;
 			captureKicked_ = false;
 			warmupDone_ = false;
@@ -1500,13 +2301,23 @@ void BakerWindow::onCaptureTick()
 		maxSurface = std::max(maxSurface, p->surface);
 	captures_.assign(maxSurface + 1, BakeGpu::SurfaceCapture());
 
+	int ready = 0, timedOut = 0;
 	for (const auto &p : pending_)
 	{
 		if (p->ready())
+		{
 			captures_[p->surface] = BakeGpu::finishCapture(p);
+			ready++;
+		}
 		else
+		{
 			Unigine::Log::warning("Baker: GPU readback timed out for surface %d\n", p->surface);
+			timedOut++;
+		}
 	}
+	Unigine::Log::message("Baker: captures ready=%d, timed out=%d (timed-out surfaces bake from "
+						  "the base material on the CPU)\n",
+		ready, timedOut);
 	pending_.clear();
 
 	// diagnostic dump of the capture atlases (shares the debug zones checkbox)

@@ -1,6 +1,7 @@
 #include "BakeCore.h"
 #include "BakeGpu.h"
 
+#include <UnigineDecals.h>
 #include <UnigineEngine.h>
 #include <UnigineFileSystem.h>
 #include <UnigineImage.h>
@@ -9,6 +10,8 @@
 #include <UnigineMaterials.h>
 #include <UnigineMathLib.h>
 #include <UnigineMesh.h>
+#include <UnigineNodes.h>
+#include <UnigineWorld.h>
 #include <UnigineXml.h>
 
 #include <algorithm>
@@ -17,7 +20,11 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -325,6 +332,10 @@ struct TargetTri
 	vec3 faceN;         // world-space geometric normal (skew-mask ray direction)
 	vec2 uv0, uv1, uv2; // UV0
 	int group = 0;      // rays trace only into this bake group's high-poly set
+	// cage of the low-poly part this triangle belongs to (meters): how far above
+	// the surface the ray starts and how far below it keeps searching
+	float frontal = 0.05f;
+	float rear = 0.05f;
 };
 
 struct TBN
@@ -423,6 +434,454 @@ bool sourceNormalInvertG(const char *path)
 	return false;
 }
 
+//------------------------------------------------------------------------------
+// Decals. Decals are separate projector nodes (DecalOrtho/Proj/Mesh) that the
+// engine blends into the gbuffer of whatever geometry they cover. To bake them
+// we sample each covering decal at the world hit point of every texel's ray and
+// blend it over the base material — the same result the deferred decal pass
+// produces, evaluated on the CPU. All engine access happens here (main thread,
+// bake start); the workers only read the plain POD below.
+//------------------------------------------------------------------------------
+// A mesh decal's footprint: its triangles in the decal's object-space XY plane
+// (the projection plane) with their authored UVs, plus a uniform grid for fast
+// point location. A world hit point projected to object XY is looked up here to
+// get the mesh UV to sample the decal material with.
+struct DTri
+{
+	vec2 p[3];
+	vec2 uv[3];
+	float z[3]; // object-space Z of each corner (the decal mesh surface height)
+};
+struct MeshFootprint
+{
+	std::vector<DTri> tris;
+	vec2 bbMin{1e30f, 1e30f}, bbMax{-1e30f, -1e30f};
+	float zMin = 1e30f, zMax = -1e30f; // mesh extent along the projection axis
+	int gw = 1, gh = 1;
+	std::vector<std::vector<int>> cells;
+
+	void build()
+	{
+		int n = int(tris.size());
+		int g = Math::clamp(int(Math::sqrt(float(n))), 1, 64);
+		gw = gh = g;
+		cells.assign(size_t(gw) * gh, {});
+		vec2 span = bbMax - bbMin;
+		span.x = Math::max(span.x, 1e-6f);
+		span.y = Math::max(span.y, 1e-6f);
+		for (int i = 0; i < n; i++)
+		{
+			const DTri &t = tris[i];
+			vec2 tmn = min(t.p[0], min(t.p[1], t.p[2]));
+			vec2 tmx = max(t.p[0], max(t.p[1], t.p[2]));
+			int x0 = Math::clamp(int((tmn.x - bbMin.x) / span.x * gw), 0, gw - 1);
+			int x1 = Math::clamp(int((tmx.x - bbMin.x) / span.x * gw), 0, gw - 1);
+			int y0 = Math::clamp(int((tmn.y - bbMin.y) / span.y * gh), 0, gh - 1);
+			int y1 = Math::clamp(int((tmx.y - bbMin.y) / span.y * gh), 0, gh - 1);
+			for (int y = y0; y <= y1; y++)
+				for (int x = x0; x <= x1; x++)
+					cells[y * gw + x].push_back(i);
+		}
+	}
+
+	// Locates the point in the footprint. Returns the interpolated UV and the
+	// mesh surface Z there (the decal's height at that XY). Among overlapping
+	// triangles picks the one whose Z is closest to refZ (the ray hit) so the
+	// decal binds to the nearest surface, not a foreign one behind it.
+	bool sample(const vec2 &p, float refZ, vec2 &outUV, float &outZ) const
+	{
+		if (p.x < bbMin.x || p.x > bbMax.x || p.y < bbMin.y || p.y > bbMax.y)
+			return false;
+		vec2 span = bbMax - bbMin;
+		span.x = Math::max(span.x, 1e-6f);
+		span.y = Math::max(span.y, 1e-6f);
+		int cx = Math::clamp(int((p.x - bbMin.x) / span.x * gw), 0, gw - 1);
+		int cy = Math::clamp(int((p.y - bbMin.y) / span.y * gh), 0, gh - 1);
+		bool found = false;
+		float best = 1e30f;
+		for (int idx : cells[cy * gw + cx])
+		{
+			const DTri &t = tris[idx];
+			vec2 v0 = t.p[1] - t.p[0], v1 = t.p[2] - t.p[0], v2 = p - t.p[0];
+			float d00 = dot(v0, v0), d01 = dot(v0, v1), d11 = dot(v1, v1);
+			float d20 = dot(v2, v0), d21 = dot(v2, v1);
+			float den = d00 * d11 - d01 * d01;
+			if (Math::abs(den) < 1e-12f)
+				continue;
+			float v = (d11 * d20 - d01 * d21) / den;
+			float w = (d00 * d21 - d01 * d20) / den;
+			float u = 1.0f - v - w;
+			if (u < -1e-4f || v < -1e-4f || w < -1e-4f)
+				continue;
+			float z = t.z[0] * u + t.z[1] * v + t.z[2] * w;
+			float dz = Math::abs(z - refZ);
+			if (dz < best)
+			{
+				best = dz;
+				outZ = z;
+				outUV = t.uv[0] * u + t.uv[1] * v + t.uv[2] * w;
+				found = true;
+			}
+		}
+		return found;
+	}
+};
+
+struct DecalSample
+{
+	mat4 iworld;      // world -> decal object space
+	mat4 proj;        // object space -> clip (ortho/proj)
+	bool perspective; // DecalProj divides by w; ortho does not
+	vec3 axisX, axisY, axisZ; // decal world axes (Z = projector up = out of surface)
+	vec3 bbMin, bbMax;        // world bbox for the per-texel cull
+	ImagePtr albedo, normal, shading;
+	vec4 albedoColor{1.0f, 1.0f, 1.0f, 1.0f};
+	float opacity = 1.0f;
+	bool normalInvertG = false;
+	int order = 0;
+	// scalar shading parameters (multiply the shading texture, like mesh_base)
+	float metalnessParam = 0.0f;
+	float roughnessParam = 1.0f;
+	bool hasShadingParams = false;
+	// mesh decals: object-space footprint + half thickness along Z (null = ortho/proj)
+	std::shared_ptr<MeshFootprint> footprint;
+	float halfZ = 1e30f;
+	String name;
+};
+
+// A compact bake report mirrored to %TEMP%/baker_last_bake.txt (overwritten each
+// bake) so the decal discovery + hit stats can be inspected without the editor
+// console. Best-effort; failures are silent.
+std::ofstream g_report;
+void openReport()
+{
+	std::error_code ec;
+	auto path = std::filesystem::temp_directory_path(ec) / "baker_last_bake.txt";
+	g_report.open(path, std::ios::out | std::ios::trunc);
+}
+template <typename... A> void report(const char *fmt, A... a)
+{
+	Log::message(fmt, a...);
+	if (g_report.is_open())
+	{
+		char buf[1024];
+		std::snprintf(buf, sizeof(buf), fmt, a...);
+		g_report << buf;
+		g_report.flush();
+	}
+}
+
+std::vector<DecalSample> collectDecals(const vec3 &hiMin, const vec3 &hiMax,
+	const std::vector<int> &explicitIds, const std::vector<NodePtr> &highNodes, float decalDistance,
+	std::vector<std::pair<String, ImagePtr>> &textureCache)
+{
+	std::vector<DecalSample> out;
+	int totalDecals = 0;
+	const bool autoMode = explicitIds.empty();
+
+	// Gather candidate decal nodes.
+	// Auto: the decals live in the SAME instance hierarchy as the high-poly
+	// (that's how the artist placed them), so walk the subtrees of the high
+	// nodes' top ancestors — these are correctly-placed instance nodes, unlike a
+	// node reference's shared template (which sits at the prefab origin).
+	// Explicit: whatever the user picked, resolved by id.
+	std::vector<NodePtr> candidates;
+	std::set<int> visited;
+	std::vector<NodePtr> stack;
+	if (!autoMode)
+	{
+		for (int id : explicitIds)
+			if (NodePtr n = World::getNodeByID(id))
+				stack.push_back(n);
+	}
+	else
+	{
+		for (const NodePtr &h : highNodes)
+		{
+			NodePtr top = h;
+			while (top && top->getParent())
+				top = top->getParent();
+			if (top)
+				stack.push_back(top);
+		}
+	}
+	while (!stack.empty())
+	{
+		NodePtr n = stack.back();
+		stack.pop_back();
+		if (!n || !visited.insert(n->getID()).second)
+			continue;
+		for (int i = 0; i < n->getNumChildren(); i++)
+			stack.push_back(n->getChild(i));
+		// descend into node reference contents too (decals nested in a prefab —
+		// e.g. r5_interior_digital_clock — are otherwise unreachable)
+		if (n->getType() == Node::NODE_REFERENCE)
+			if (Ptr<NodeReference> nr = checked_ptr_cast<NodeReference>(n))
+				stack.push_back(nr->getReference());
+		candidates.push_back(n);
+	}
+	report("Baker: decal search scanned %d nodes (%s)\n", int(candidates.size()),
+		autoMode ? "auto: high-poly hierarchy" : "explicit selection");
+
+	for (const NodePtr &n : candidates)
+	{
+		// hiding is viewport-only (like meshes) — bake decals even when disabled
+		if (!n || !n->isDecal())
+			continue;
+		totalDecals++;
+		Ptr<Decal> d = checked_ptr_cast<Decal>(n);
+		if (!d)
+			continue;
+
+		// world bbox: cheap reject of far decals in auto mode; explicit picks
+		// are always kept (the user chose them)
+		WorldBoundBox wbb = n->getWorldBoundBox();
+		auto toV3 = [](const Vec3 &v) { return vec3(float(v.x), float(v.y), float(v.z)); };
+		Vec3 wpos = n->getWorldTransform().getColumn3(3);
+		vec3 dmin = toV3(wbb.minimum), dmax = toV3(wbb.maximum);
+		report("Baker: [decal] \"%s\" (%s) enabled=%d valid=%d pos[%.2f %.2f %.2f] bbox[%.2f %.2f "
+			   "%.2f]..[%.2f %.2f %.2f]\n",
+			n->getName(), n->getTypeName(), n->isEnabled() ? 1 : 0, wbb.isValid() ? 1 : 0,
+			float(wpos.x), float(wpos.y), float(wpos.z), dmin.x, dmin.y, dmin.z, dmax.x, dmax.y,
+			dmax.z);
+		if (!wbb.isValid())
+		{
+			// disabled decals can report an invalid/empty world bbox; fall back to
+			// the transform position so the overlap cull still has something
+			if (autoMode)
+				continue;
+			dmin = dmax = toV3(wpos);
+		}
+		if (autoMode
+			&& (dmax.x < hiMin.x || dmin.x > hiMax.x || dmax.y < hiMin.y || dmin.y > hiMax.y
+				|| dmax.z < hiMin.z || dmin.z > hiMax.z))
+			continue;
+
+		DecalSample s;
+		Mat4 world = d->getWorldTransform();
+		s.iworld = mat4(inverse(world));
+
+		// getProjection() lives on the concrete decal subclass, not on Decal.
+		// DecalMesh has no projection matrix — its footprint is the mesh itself,
+		// looked up in object-space XY.
+		int dtype = n->getType();
+		s.perspective = false;
+		if (dtype == Node::DECAL_ORTHO)
+			s.proj = checked_ptr_cast<DecalOrtho>(n)->getProjection();
+		else if (dtype == Node::DECAL_PROJ)
+		{
+			s.proj = checked_ptr_cast<DecalProj>(n)->getProjection();
+			s.perspective = true;
+		}
+		else if (dtype == Node::DECAL_MESH)
+		{
+			Ptr<DecalMesh> dm = checked_ptr_cast<DecalMesh>(n);
+			Ptr<ConstMesh> dmesh = dm ? dm->getMeshForceRAM() : Ptr<ConstMesh>();
+			if (!dmesh)
+			{
+				report("Baker: mesh decal \"%s\" has no mesh, skipped\n", n->getName());
+				continue;
+			}
+			auto fp = std::make_shared<MeshFootprint>();
+			vec3 lmin(1e30f, 1e30f, 1e30f), lmax(-1e30f, -1e30f, -1e30f);
+			for (int su = 0; su < dmesh->getNumSurfaces(); su++)
+			{
+				if (dmesh->getNumTexCoords0(su) <= 0)
+					continue;
+				const Vector<int> &ci = dmesh->getCIndices(su);
+				const Vector<int> &ti = dmesh->getTIndices(su);
+				int nt = ci.size() / 3;
+				for (int k = 0; k < nt; k++)
+				{
+					DTri t;
+					for (int j = 0; j < 3; j++)
+					{
+						vec3 v = dmesh->getVertex(ci[k * 3 + j], su);
+						t.p[j] = vec2(v.x, v.y); // decal projects along local Z
+						t.z[j] = v.z;
+						t.uv[j] = dmesh->getTexCoord0(ti[k * 3 + j], su);
+						fp->bbMin = min(fp->bbMin, t.p[j]);
+						fp->bbMax = max(fp->bbMax, t.p[j]);
+						lmin = min(lmin, v);
+						lmax = max(lmax, v);
+					}
+					fp->tris.push_back(t);
+				}
+			}
+			if (fp->tris.empty())
+			{
+				report("Baker: mesh decal \"%s\" has no UV triangles, skipped\n", n->getName());
+				continue;
+			}
+			fp->zMin = lmin.z;
+			fp->zMax = lmax.z;
+			fp->build();
+			s.footprint = fp;
+			float r = d->getRadius();
+			// how far a target surface may sit from the decal mesh surface along
+			// the projection axis and still receive the decal (user setting).
+			// Screen-projection decals hug the mesh, so a small band binds only to
+			// the nearest geometry; a wider one bleeds onto foreign parts.
+			s.halfZ = Math::max(decalDistance, 1e-4f);
+			report("Baker:   mesh footprint local bbox [%.3f %.3f %.3f]..[%.3f %.3f %.3f] "
+				   "tris=%d radius=%.3f halfZ=%.3f\n",
+				lmin.x, lmin.y, lmin.z, lmax.x, lmax.y, lmax.z, int(fp->tris.size()), r, s.halfZ);
+		}
+		else
+			continue;
+
+		mat3 rot = mat3(mat4(world));
+		s.axisX = normalize(rot * vec3(1.0f, 0.0f, 0.0f));
+		s.axisY = normalize(rot * vec3(0.0f, 1.0f, 0.0f));
+		s.axisZ = normalize(rot * vec3(0.0f, 0.0f, 1.0f));
+		s.bbMin = dmin;
+		s.bbMax = dmax;
+		s.opacity = d->getOpacity();
+		s.name = n->getName();
+
+		if (MaterialPtr m = d->getMaterial())
+		{
+			if (m->findParameter("albedo_color") >= 0)
+				s.albedoColor = m->getParameterFloat4("albedo_color");
+			s.albedo = loadTexture(m->getTexturePath("albedo"), textureCache);
+			s.shading = loadTexture(m->getTexturePath("shading"), textureCache);
+			s.normal = loadTexture(m->getTexturePath("normal"), textureCache);
+			if (s.normal)
+				s.normalInvertG = sourceNormalInvertG(m->getTexturePath("normal"));
+			if (m->findParameter("render_order") >= 0)
+				s.order = int(m->getParameterFloat("render_order"));
+			// scalar metalness/roughness multipliers (mesh_base convention)
+			if (m->findParameter("metalness") >= 0)
+			{
+				s.metalnessParam = m->getParameterFloat("metalness");
+				s.hasShadingParams = true;
+			}
+			if (m->findParameter("roughness") >= 0)
+			{
+				s.roughnessParam = m->getParameterFloat("roughness");
+				s.hasShadingParams = true;
+			}
+		}
+
+		report("Baker: decal \"%s\" (%s) opacity=%.2f%s%s%s bbox[%.2f %.2f %.2f]..[%.2f %.2f %.2f]\n",
+			n->getName(), n->getTypeName(), s.opacity, s.albedo ? " alb" : "",
+			s.normal ? " nrm" : "", s.shading ? " sh" : "", dmin.x, dmin.y, dmin.z, dmax.x, dmax.y,
+			dmax.z);
+		out.push_back(std::move(s));
+	}
+
+	// render order: lower first, later decals paint on top (stable = discovery order)
+	std::stable_sort(out.begin(), out.end(),
+		[](const DecalSample &a, const DecalSample &b) { return a.order < b.order; });
+
+	report("Baker: high-poly bbox [%.2f %.2f %.2f]..[%.2f %.2f %.2f]\n", hiMin.x, hiMin.y, hiMin.z,
+		hiMax.x, hiMax.y, hiMax.z);
+	report("Baker: %d enabled decal(s) in world, %d overlap the high-poly\n", totalDecals,
+		int(out.size()));
+	return out;
+}
+
+// Blends every covering decal over the base albedo/shading/world-normal at one
+// world hit point, in render order. Mutates the three in place. Returns the
+// number of decals that actually contributed (for diagnostics).
+int applyDecals(const std::vector<DecalSample> &decals, const vec3 &worldHit, vec4 &albedo,
+	vec4 &shading, vec3 &worldN, bool flipNormalY, std::vector<std::atomic<long long>> *hits)
+{
+	int applied = 0;
+	for (size_t di = 0; di < decals.size(); di++)
+	{
+		const DecalSample &d = decals[di];
+		if (worldHit.x < d.bbMin.x || worldHit.x > d.bbMax.x || worldHit.y < d.bbMin.y
+			|| worldHit.y > d.bbMax.y || worldHit.z < d.bbMin.z || worldHit.z > d.bbMax.z)
+			continue;
+
+		vec4 po = d.iworld * vec4(worldHit, 1.0f);
+		vec2 uv;
+		if (d.footprint)
+		{
+			// mesh decal: locate the object-space XY point in the footprint, then
+			// bind only to surfaces within the projection depth of the decal mesh
+			// surface there (prevents projecting onto foreign geometry that merely
+			// shares the same XY column further along Z — the "ghost" projections)
+			float meshZ;
+			if (!d.footprint->sample(vec2(po.x, po.y), po.z, uv, meshZ))
+				continue;
+			if (Math::abs(po.z - meshZ) > d.halfZ)
+				continue;
+		}
+		else
+		{
+			vec4 clip = d.proj * po;
+			vec3 ndc;
+			if (d.perspective)
+			{
+				if (clip.w <= 1e-6f)
+					continue;
+				ndc = vec3(clip.x, clip.y, clip.z) / clip.w;
+			}
+			else
+				ndc = vec3(clip.x, clip.y, clip.z);
+			// inside the projection box? clip x/y in [-1,1]; depth kept lenient
+			// ([-1,1] covers both D3D [0,1] and GL [-1,1] conventions — the world
+			// bbox cull already bounds the range, decals are thin)
+			if (ndc.x < -1.0f || ndc.x > 1.0f || ndc.y < -1.0f || ndc.y > 1.0f || ndc.z < -1.0f
+				|| ndc.z > 1.0f)
+				continue;
+			// texture UV in the decal (V flipped for Image::get2D row order)
+			uv = vec2(ndc.x * 0.5f + 0.5f, 1.0f - (ndc.y * 0.5f + 0.5f));
+		}
+
+		// surface must face the projector (projector shoots along -axisZ)
+		float cosA = dot(worldN, d.axisZ);
+		if (cosA <= 0.0f)
+			continue;
+
+		vec4 dalb = d.albedoColor;
+		if (d.albedo)
+			dalb = d.albedo->toVec4(d.albedo->get2D(uv)) * d.albedoColor;
+		float a = dalb.w * d.opacity * saturate(cosA);
+		if (a <= 0.001f)
+			continue;
+		applied++;
+		if (hits)
+			(*hits)[di].fetch_add(1, std::memory_order_relaxed);
+
+		albedo = vec4(albedo.x + (dalb.x - albedo.x) * a, albedo.y + (dalb.y - albedo.y) * a,
+			albedo.z + (dalb.z - albedo.z) * a, albedo.w);
+
+		// shading (_sh: R=metalness, G=roughness, B=specular, A=microfiber). The
+		// scalar metalness/roughness parameters multiply the texture channels
+		// (mesh_base convention); with no texture they are used directly.
+		if (d.shading || d.hasShadingParams)
+		{
+			vec4 ds(d.metalnessParam, d.roughnessParam, 0.5f, 0.0f);
+			if (d.shading)
+			{
+				vec4 t = d.shading->toVec4(d.shading->get2D(uv));
+				ds = vec4(t.x * d.metalnessParam, t.y * d.roughnessParam, t.z, t.w);
+			}
+			shading = vec4(shading.x + (ds.x - shading.x) * a, shading.y + (ds.y - shading.y) * a,
+				shading.z + (ds.z - shading.z) * a, shading.w + (ds.w - shading.w) * a);
+		}
+
+		if (d.normal)
+		{
+			vec4 nm = d.normal->toVec4(d.normal->get2D(uv));
+			float nx = nm.x * 2.0f - 1.0f;
+			float ny = nm.y * 2.0f - 1.0f;
+			// decal normal maps use the opposite green-channel convention here —
+			// flip Y so the relief is not inverted (toggled by the global setting)
+			if (flipNormalY == d.normalInvertG)
+				ny = -ny;
+			float nz = Math::sqrt(Math::max(1.0f - nx * nx - ny * ny, 0.0f));
+			// decal tangent frame: X/Y in the projection plane, Z out of the surface
+			vec3 dWN = normalize(d.axisX * nx + d.axisY * ny + d.axisZ * nz);
+			worldN = normalize(worldN + (dWN - worldN) * a);
+		}
+	}
+	return applied;
+}
+
 } // namespace
 
 //------------------------------------------------------------------------------
@@ -446,6 +905,9 @@ Result bake(const std::vector<BakeGroup> &groups,
 	for (const BakeGroup &g : groups)
 		if (g.highs.empty() || g.lows.empty())
 			return fail("A bake group has no high-poly or no low-poly set.");
+
+	// diagnostics report (mirrors key log lines to %TEMP%/baker_last_bake.txt)
+	openReport();
 
 	const Ptr<ObjectMeshStatic> &firstHigh = groups[0].highs[0];
 	const Ptr<ObjectMeshStatic> &firstLow = groups[0].lows[0];
@@ -495,6 +957,10 @@ Result bake(const std::vector<BakeGroup> &groups,
 			high->getName(), s, highMesh->getSurfaceName(ls), highMesh->getNumCIndices(ls) / 3, high->isEnabled(ls) ? 1 : 0,
 			high->getViewportMask(ls), high->getMinVisibleDistance(ls), high->getMaxVisibleDistance(ls),
 			high->getMaterial(ls) ? high->getMaterial(ls)->getFilePath().get() : "<none>");
+		if (g_report.is_open())
+			g_report << "Baker: surface " << s << " material=\""
+					 << (high->getMaterial(ls) ? high->getMaterial(ls)->getFilePath().get() : "<none>")
+					 << "\"\n";
 
 		// bake only what is actually visible up close:
 		// skip disabled surfaces, surfaces hidden by viewport mask,
@@ -585,13 +1051,17 @@ Result bake(const std::vector<BakeGroup> &groups,
 			surf.gpu = (*settings.gpuCaptures)[s];
 			if (!surf.gpu.atlasUV.empty())
 			{
-				// chart-repacked capture: per-corner atlas coordinates
-				if (int(surf.gpu.atlasUV.size()) == int(tind.size()))
+				// chart-repacked capture: per-corner atlas coordinates. SourceTri
+				// ::corner indexes them by cindex triangle, so both index arrays
+				// must agree in length or the per-hit lookup would read past the
+				// end (the mesh API does not guarantee they match).
+				if (int(surf.gpu.atlasUV.size()) == int(tind.size())
+					&& int(cind.size()) == int(tind.size()))
 					surf.useGpu = true;
 				else
-					Log::warning("Baker: surface %d capture atlas size mismatch (%d vs %d), "
-						"falling back to texture sampling\n",
-						s, int(surf.gpu.atlasUV.size()), int(tind.size()));
+					Log::warning("Baker: surface %d capture atlas size mismatch "
+						"(atlas %d, tindices %d, cindices %d), falling back to texture sampling\n",
+						s, int(surf.gpu.atlasUV.size()), int(tind.size()), int(cind.size()));
 			}
 			// legacy path: a UV1-space capture needs the surface's UV1 to sample it back
 			else if (surf.gpu.uvChannel == 1 && !surf.hasUV1)
@@ -604,6 +1074,24 @@ Result bake(const std::vector<BakeGroup> &groups,
 		{
 			Log::warning("Baker: no GPU capture for surface %d, falling back to texture sampling\n", s);
 		}
+			// Report how much of this capture actually holds chart data. Real
+			// assets exist whose UV set collapses part of the mesh to zero area
+			// (surface 27 of the R5 interior: 400 of 800 triangles, and it has no
+			// UV1 to fall back to) — those faces get no pixels at all, and each
+			// hit landing there is routed to the material textures per TEXEL via
+			// the coverage mask below.
+			if (surf.useGpu && !surf.gpu.coverage.empty())
+			{
+				size_t covered = 0;
+				for (unsigned char c : surf.gpu.coverage)
+					covered += c ? 1u : 0u;
+				const double frac = double(covered) / double(surf.gpu.coverage.size());
+				if (frac < 0.02)
+					Log::warning("Baker: surface %d capture is almost empty (%.0f%% of the "
+								 "atlas covered) - it bakes from the material textures\n",
+						s, frac * 100.0);
+			}
+
 
 		srcTris.reserve(srcTris.size() + numTris);
 		for (int k = 0; k < numTris; k++)
@@ -643,6 +1131,15 @@ Result bake(const std::vector<BakeGroup> &groups,
 		mat4 lowTm = mat4(low->getWorldTransform());
 		mat3 lowNm = transpose(inverse(mat3(lowTm)));
 
+		// this part's cage: its own override if it has one, else the global pair
+		vec2 partCage(Math::max(settings.frontalDistance, 1e-5f),
+			Math::max(settings.rearDistance, 0.0f));
+		{
+			auto it = settings.partCage.find(low->getID());
+			if (it != settings.partCage.end())
+				partCage = vec2(Math::max(it->second.x, 1e-5f), Math::max(it->second.y, 0.0f));
+		}
+
 		for (int s = 0; s < lowMesh->getNumSurfaces(); s++)
 		{
 			if (lowMesh->getNumTexCoords0(s) <= 0)
@@ -674,6 +1171,8 @@ Result bake(const std::vector<BakeGroup> &groups,
 				tr.uv1 = lowMesh->getTexCoord0(i1, s);
 				tr.uv2 = lowMesh->getTexCoord0(i2, s);
 				tr.group = int(gi);
+				tr.frontal = partCage.x;
+				tr.rear = partCage.y;
 				tgtTris.push_back(tr);
 			}
 		}
@@ -769,12 +1268,56 @@ Result bake(const std::vector<BakeGroup> &groups,
 		bvhs[gi].build(groupTris[gi]);
 
 	//--------------------------------------------------------------------------
+	// World decals overlapping the high-poly (projected onto the bake per texel).
+	//--------------------------------------------------------------------------
+	std::vector<DecalSample> decals;
+	if (settings.bakeDecals)
+	{
+		vec3 hiMin(1e30f, 1e30f, 1e30f), hiMax(-1e30f, -1e30f, -1e30f);
+		for (const auto &gt : groupTris)
+			for (const SourceTri &t : gt)
+			{
+				vec3 v[3] = {t.p0, t.p0 + t.e1, t.p0 + t.e2};
+				for (const vec3 &p : v)
+				{
+					hiMin = min(hiMin, p);
+					hiMax = max(hiMax, p);
+				}
+			}
+
+		// node world positions (to compare against the decal positions)
+		for (const BakeGroup &g : groups)
+		{
+			for (const Ptr<ObjectMeshStatic> &h : g.highs)
+			{
+				Vec3 p = h->getWorldTransform().getTranslate();
+				report("Baker: [high node] \"%s\" worldpos[%.2f %.2f %.2f]\n", h->getName(),
+					float(p.x), float(p.y), float(p.z));
+			}
+			for (const Ptr<ObjectMeshStatic> &l : g.lows)
+			{
+				Vec3 p = l->getWorldTransform().getTranslate();
+				report("Baker: [low node] \"%s\" worldpos[%.2f %.2f %.2f]\n", l->getName(),
+					float(p.x), float(p.y), float(p.z));
+			}
+		}
+
+		std::vector<NodePtr> highNodes;
+		for (const BakeGroup &g : groups)
+			for (const Ptr<ObjectMeshStatic> &h : g.highs)
+				highNodes.push_back(h);
+		decals = collectDecals(hiMin, hiMax, settings.decalNodeIds, highNodes,
+			settings.decalDistance, textureCache);
+	}
+	// per-decal texel-sample hit counters (diagnostics)
+	std::vector<std::atomic<long long>> decalHits(decals.size());
+
+	//--------------------------------------------------------------------------
 	// Rasterize + trace (worker threads own disjoint row bands).
 	//--------------------------------------------------------------------------
 	const int res = settings.resolution;
-	const float frontal = Math::max(settings.frontalDistance, 1e-5f);
-	const float rear = Math::max(settings.rearDistance, 0.0f);
-	const float rayLength = frontal + rear;
+	// the cage is per low-poly part now: each TargetTri carries its own
+	// frontal/rear (see Settings::partCage), resolved when the triangle was built
 	const size_t pixelCount = size_t(res) * size_t(res);
 
 	// accumulators: albedo rgba, shading rgba, normal xyz (target tangent space), weight
@@ -808,9 +1351,18 @@ Result bake(const std::vector<BakeGroup> &groups,
 
 	// hit statistics (for diagnostics)
 	std::atomic<long long> statFront(0), statRear(0), statBackface(0), statMiss(0);
+	// per-source-surface diagnostics, merged from the workers at the end
+	std::mutex surfStatMutex;
+	std::vector<long long> surfHit(srcSurfaces.size(), 0);
+	std::vector<long long> surfGpu(srcSurfaces.size(), 0);
+	std::vector<double> surfAlb(srcSurfaces.size(), 0.0);
+	std::atomic<long long> statDecal(0); // texel-samples that received a decal
 
 	auto worker = [&](int bandY0, int bandY1) {
-		long long locFront = 0, locRear = 0, locBackface = 0, locMiss = 0;
+		long long locFront = 0, locRear = 0, locBackface = 0, locMiss = 0, locDecal = 0;
+		std::vector<long long> locSurfHit(srcSurfaces.size(), 0);
+		std::vector<long long> locSurfGpu(srcSurfaces.size(), 0);
+		std::vector<double> locSurfAlb(srcSurfaces.size(), 0.0);
 		for (const TargetTri &tr : tgtTris)
 		{
 			if (cancelFlag.load(std::memory_order_relaxed))
@@ -820,6 +1372,11 @@ Result bake(const std::vector<BakeGroup> &groups,
 			// rays of this triangle see only its own bake group's high-poly
 			const std::vector<SourceTri> &srcTris = groupTris[tr.group];
 			const BVH &bvh = bvhs[tr.group];
+
+			// cage of the low-poly part this triangle belongs to
+			const float frontal = tr.frontal;
+			const float rear = tr.rear;
+			const float rayLength = frontal + rear;
 
 			// UV triangle in pixel space
 			vec2 a = tr.uv0 * float(res);
@@ -931,13 +1488,21 @@ Result bake(const std::vector<BakeGroup> &groups,
 						// fallbacks when the material has no textures: engine constants
 						vec4 albedo = surf.albedoColor;
 						vec4 shading(surf.metalness, surf.roughness, 0.5f, 0.0f);
-						vec4 emission(0.0f, 0.0f, 0.0f, 1.0f);
+						// The emission ALPHA carries a mask: opaque where the hit
+						// surface has its emission state ON, transparent where it
+						// does not. The glow itself can be legitimately black in
+						// places, so colour alone cannot tell "not emissive" from
+						// "emissive but dark" — the mask can, which is what makes
+						// the map usable for compositing elsewhere.
+						vec4 emission(0.0f, 0.0f, 0.0f, 0.0f);
 						if (surf.emissionOn)
 							emission = vec4(surf.emissionColor.xyz * surf.emissionScale, 1.0f);
+						vec3 worldN = srcN;
+						// diagnostics: did this sample read the GPU capture?
+						bool sampledGpu = false;
 						if (surf.hasUV)
 						{
 							vec2 suvRaw = surf.uv[st.t0] * w0 + surf.uv[st.t1] * hitU + surf.uv[st.t2] * hitV;
-							vec3 worldN = srcN;
 
 							// sample the "as rendered" unwrap gbuffer captures through the
 							// chart-repacked atlas (unique by construction); the pack
@@ -973,7 +1538,29 @@ Result bake(const std::vector<BakeGroup> &groups,
 							{
 								cuv.x = saturate(cuv.x);
 								cuv.y = saturate(cuv.y);
+							}
 
+							// Does the capture actually hold data at this texel?
+							// The render background is a BLACK quad, so brightness
+							// cannot tell background from a legitimately black
+							// material — only the coverage mask can. Uncovered means
+							// this piece of the mesh has no unwrap area (collapsed
+							// UVs), so bake it from the material textures. Gutter
+							// texels count as covered, so chart edges still sample
+							// the dilated capture. Per texel, not per triangle: a
+							// triangle straddling a chart edge must not flip whole.
+							if (gpuHit && !surf.gpu.coverage.empty())
+							{
+								const int cvw = surf.gpu.coverageWidth;
+								const int cvh = surf.gpu.coverageHeight;
+								const int tx = Math::clamp(int(cuv.x * cvw), 0, cvw - 1);
+								const int ty = Math::clamp(int(cuv.y * cvh), 0, cvh - 1);
+								if (!surf.gpu.coverage[size_t(ty) * size_t(cvw) + size_t(tx)])
+									gpuHit = false;
+							}
+
+							if (gpuHit)
+							{
 								vec4 a4 = surf.gpu.albedo->toVec4(surf.gpu.albedo->get2D(cuv));
 								vec4 s4 = surf.gpu.shading->toVec4(surf.gpu.shading->get2D(cuv));
 								// octahedral-packed normal: bilinear filtering would break the
@@ -984,13 +1571,16 @@ Result bake(const std::vector<BakeGroup> &groups,
 									Math::clamp(int(cuv.y * gh), 0, gh - 1));
 								vec4 n4 = surf.gpu.normal->toVec4(surf.gpu.normal->get2D(ncoord));
 
+								sampledGpu = true;
 								albedo = a4; // the gbuffer render target already stores sRGB-encoded albedo
 								// _sh layout: R=metalness, G=roughness, B=specular(f0), A=microfiber
 								shading = vec4(s4.x, n4.w, s4.y, s4.w);
 								if (surf.gpu.emission)
 								{
 									vec4 e4 = surf.gpu.emission->toVec4(surf.gpu.emission->get2D(cuv));
-									emission = vec4(e4.xyz, 1.0f);
+									// the capture exists for every surface, so the
+									// material's emission state decides the mask
+									emission = vec4(e4.xyz, surf.emissionOn ? 1.0f : 0.0f);
 								}
 
 								vec3 ts = BakeGpu::unpackGBufferNormal(n4);
@@ -1034,19 +1624,33 @@ Result bake(const std::vector<BakeGroup> &groups,
 								}
 							}
 
-							// into target tangent space
-							vec3 tsn(dot(tan, worldN), dot(bin, worldN), dot(nrm, worldN));
-							accNormal[pix * 3 + 0] += tsn.x;
-							accNormal[pix * 3 + 1] += tsn.y;
-							accNormal[pix * 3 + 2] += tsn.z;
 						}
-						else
+
+						// per-source-surface diagnostics (before decals): which high-poly
+						// surface this texel-sample read, whether it came from the GPU
+						// capture, and how bright it was. A surface that bakes wrong
+						// shows up here as "gpu=0" (capture never used) or as a mean
+						// far from its material's albedo.
+						locSurfHit[st.surface]++;
+						if (sampledGpu)
+							locSurfGpu[st.surface]++;
+						locSurfAlb[st.surface] += double(albedo.x + albedo.y + albedo.z) / 3.0;
+
+						// world decals blended over the base result at the world hit
+						// point (in render order), before encoding into tangent space
+						if (!decals.empty() && !settings.debugZones)
 						{
-							// no UV on high-poly: bake geometric normal only
-							accNormal[pix * 3 + 0] += dot(tan, srcN);
-							accNormal[pix * 3 + 1] += dot(bin, srcN);
-							accNormal[pix * 3 + 2] += dot(nrm, srcN);
+							vec3 worldHit = st.p0 + st.e1 * hitU + st.e2 * hitV;
+							if (applyDecals(decals, worldHit, albedo, shading, worldN,
+									settings.flipNormalY, &decalHits)
+								> 0)
+								locDecal++;
 						}
+
+						// normal into target tangent space (single path for hasUV/no-UV)
+						accNormal[pix * 3 + 0] += dot(tan, worldN);
+						accNormal[pix * 3 + 1] += dot(bin, worldN);
+						accNormal[pix * 3 + 2] += dot(nrm, worldN);
 
 						if (settings.debugZones)
 						{
@@ -1080,6 +1684,16 @@ Result bake(const std::vector<BakeGroup> &groups,
 		statRear += locRear;
 		statBackface += locBackface;
 		statMiss += locMiss;
+		statDecal += locDecal;
+		{
+			std::lock_guard<std::mutex> lock(surfStatMutex);
+			for (size_t i = 0; i < surfHit.size(); i++)
+			{
+				surfHit[i] += locSurfHit[i];
+				surfGpu[i] += locSurfGpu[i];
+				surfAlb[i] += locSurfAlb[i];
+			}
+		}
 	};
 
 	{
@@ -1113,8 +1727,68 @@ Result bake(const std::vector<BakeGroup> &groups,
 		}
 	}
 
-	Log::message("Baker: ray stats: front(above surface)=%lld rear(below surface)=%lld backface=%lld miss=%lld\n",
+	report("Baker: ray stats: front(above surface)=%lld rear(below surface)=%lld backface=%lld miss=%lld\n",
 		statFront.load(), statRear.load(), statBackface.load(), statMiss.load());
+	// per-source-surface table: pinpoints a surface that bakes wrong. "gpu%" is
+	// the share of its texel-samples that came from the GPU capture (0% = the
+	// capture was never used, so the CPU texture path produced the result) and
+	// "mean" is the average baked brightness before decals.
+	for (size_t si = 0; si < surfHit.size(); si++)
+	{
+		if (surfHit[si] <= 0)
+			continue;
+		// measure the capture image itself and the atlasUV range used to sample
+		// it: separates "the capture came back black" from "the bake sampled the
+		// wrong place in a good capture"
+		double capMean = -1.0, capCov = -1.0;
+		const SourceSurface &ss = srcSurfaces[si];
+		if (ss.gpu.albedo)
+		{
+			const int cw = ss.gpu.albedo->getWidth();
+			const int ch = ss.gpu.albedo->getHeight();
+			double sum = 0.0;
+			long long lit = 0, total = 0;
+			for (int yy = 0; yy < ch; yy += 4)
+				for (int xx = 0; xx < cw; xx += 4)
+				{
+					vec4 c = ss.gpu.albedo->toVec4(ss.gpu.albedo->get2D(ivec2(xx, yy)));
+					double l = double(c.x + c.y + c.z) / 3.0;
+					total++;
+					if (l > 0.004)
+					{
+						sum += l;
+						lit++;
+					}
+				}
+			capMean = lit > 0 ? sum / double(lit) : 0.0;
+			capCov = total > 0 ? double(lit) / double(total) : 0.0;
+		}
+		vec2 uvMin(2.0f, 2.0f), uvMax(-2.0f, -2.0f);
+		for (const vec2 &p : ss.gpu.atlasUV)
+		{
+			uvMin = min(uvMin, p);
+			uvMax = max(uvMax, p);
+		}
+		report("Baker: surf-bake %d hits=%lld gpu=%lld (%.0f%%) mean=%.4f useGpu=%d atlas=%d "
+			   "uvch=%d cap[mean=%.4f cov=%.2f %dx%d] auv[%.3f %.3f]..[%.3f %.3f]\n",
+			int(si), surfHit[si], surfGpu[si],
+			100.0 * double(surfGpu[si]) / double(surfHit[si]),
+			surfAlb[si] / double(surfHit[si]),
+			ss.useGpu ? 1 : 0, int(ss.gpu.atlasUV.size()), ss.gpu.uvChannel,
+			capMean, capCov,
+			ss.gpu.albedo ? ss.gpu.albedo->getWidth() : 0,
+			ss.gpu.albedo ? ss.gpu.albedo->getHeight() : 0,
+			uvMin.x, uvMin.y, uvMax.x, uvMax.y);
+	}
+	if (settings.bakeDecals)
+	{
+		report("Baker: decal-covered texel-samples=%lld\n", statDecal.load());
+		for (size_t di = 0; di < decals.size(); di++)
+			report("Baker: decal-hits \"%s\" (%s) = %lld\n", decals[di].name.get(),
+				decals[di].footprint ? "mesh" : "proj", decalHits[di].load());
+	}
+	if (g_report.is_open())
+		g_report.close();
 
 	if (!progress(86, "Processing edges..."))
 	{
@@ -1481,6 +2155,154 @@ bool isSurfaceBakeable(const Ptr<ObjectMeshStatic> &obj, int surface)
 	if (obj->getMinVisibleDistance(surface) > 0.0f || obj->getMaxVisibleDistance(surface) <= 0.0f)
 		return false;
 	return true;
+}
+
+std::map<int, vec2> suggestPartCage(const std::vector<BakeGroup> &groups,
+	float maxProbe, const ProgressFn &progress)
+{
+	std::map<int, vec2> out;
+	const float probe = Math::max(maxProbe, 1e-4f);
+
+	int partsTotal = 0;
+	for (const BakeGroup &g : groups)
+		partsTotal += int(g.lows.size());
+	int partsDone = 0;
+
+	for (const BakeGroup &g : groups)
+	{
+		// high-poly triangles of this group, positions only: the probe just needs
+		// the nearest hit, no materials, UVs or normals
+		std::vector<SourceTri> tris;
+		for (const Ptr<ObjectMeshStatic> &high : g.highs)
+		{
+			Ptr<ConstMesh> hm = high->getMeshForceRAM();
+			if (!hm)
+				continue;
+			mat4 tm = mat4(high->getWorldTransform());
+			for (int s = 0; s < hm->getNumSurfaces(); s++)
+			{
+				if (!isSurfaceBakeable(high, s))
+					continue;
+				const Vector<int> &cind = hm->getCIndices(s);
+				for (int k = 0; k + 2 < cind.size(); k += 3)
+				{
+					const vec3 a = tm * hm->getVertex(cind[k], s);
+					const vec3 b = tm * hm->getVertex(cind[k + 1], s);
+					const vec3 c = tm * hm->getVertex(cind[k + 2], s);
+					SourceTri st;
+					st.p0 = a;
+					st.e1 = b - a;
+					st.e2 = c - a;
+					st.surface = 0;
+					st.t0 = st.t1 = st.t2 = 0;
+					st.corner = 0;
+					tris.push_back(st);
+				}
+			}
+		}
+		if (tris.empty())
+			continue;
+		BVH bvh;
+		bvh.build(tris);
+		auto nearest = [](int, float t, float, float) { return t; };
+
+		for (const Ptr<ObjectMeshStatic> &low : g.lows)
+		{
+			partsDone++;
+			if (progress
+				&& !progress(partsTotal > 0 ? partsDone * 100 / partsTotal : 100, "Probing the cage"))
+				return out;
+			Ptr<ConstMesh> lm = low->getMeshForceRAM();
+			if (!lm)
+				continue;
+			mat4 tm = mat4(low->getWorldTransform());
+			mat3 nm = transpose(inverse(mat3(tm)));
+
+			// Probe range for THIS part, from its own size. Using the whole
+			// model's extent here is what made the probe useless: on a car
+			// interior it came out at 0.3 m, and from that height a ray hits the
+			// roof or the dashboard long before the part's own high-poly, so the
+			// statistics measured the distance to NEIGHBOURS.
+			float probeLen = probe;
+			{
+				const auto bb = low->getWorldBoundBox();
+				const vec3 diag = vec3(bb.maximum) - vec3(bb.minimum);
+				const float d = length(diag);
+				if (d > 0.0f)
+					probeLen = Math::clamp(d * 0.1f, 0.005f, probe);
+			}
+
+			// where the high-poly detail sits relative to the low-poly surface
+			std::vector<float> above, below;
+			for (int s = 0; s < lm->getNumSurfaces(); s++)
+			{
+				const Vector<int> &cind = lm->getCIndices(s);
+				const Vector<int> &tind = lm->getTIndices(s);
+				if (cind.size() != tind.size())
+					continue;
+				const int numTris = cind.size() / 3;
+				// a few thousand probes per part are plenty to find the extremes
+				const int step = numTris > 3000 ? numTris / 3000 : 1;
+				for (int k = 0; k < numTris; k += step)
+				{
+					const int c0 = k * 3;
+					const vec3 a = tm * lm->getVertex(cind[c0], s);
+					const vec3 b = tm * lm->getVertex(cind[c0 + 1], s);
+					const vec3 c = tm * lm->getVertex(cind[c0 + 2], s);
+					// authored shading normals: reliably outward, unlike a face
+					// cross product whose sign follows the triangle winding
+					vec3 n = nm * lm->getTangent(tind[c0], s).getNormal()
+						+ nm * lm->getTangent(tind[c0 + 1], s).getNormal()
+						+ nm * lm->getTangent(tind[c0 + 2], s).getNormal();
+					if (length2(n) < 1e-12f)
+						continue;
+					n = normalize(n);
+					const vec3 pos = (a + b + c) / 3.0f;
+					// Two SHORT rays from the surface itself, outward and inward,
+					// each taking the FIRST hit. Starting at the surface is what
+					// keeps the measurement honest: the part's own high-poly is
+					// millimetres away and always wins, while a foreign surface
+					// further along the normal is simply out of range.
+					const float eps = 1e-4f;
+					float t = 0.0f, u = 0.0f, v = 0.0f;
+					if (bvh.trace(tris, pos + n * eps, n, probeLen, nearest, t, u, v) >= 0)
+						above.push_back(t + eps);
+					if (bvh.trace(tris, pos - n * eps, -n, probeLen, nearest, t, u, v) >= 0)
+						below.push_back(t + eps);
+				}
+			}
+			if (above.empty() && below.empty())
+				continue; // nothing hit: keep whatever the caller has for this part
+
+			// the single farthest probe is often a stray hit on a neighbouring
+			// part, so take a high percentile instead of the maximum, then add a
+			// margin so the cage is not exactly on the limit
+			auto percentile = [](std::vector<float> &v, float p) -> float {
+				if (v.empty())
+					return 0.0f;
+				std::sort(v.begin(), v.end());
+				const size_t i = size_t(p * float(v.size() - 1) + 0.5f);
+				return v[Math::min(i, v.size() - 1)];
+			};
+			// 95th percentile, not the maximum: a handful of samples always land
+			// on a neighbour through a gap, and the cage must not be sized by
+			// them. Erring tight is the safe direction — a cage that is too big
+			// makes parts catch each other's detail, while a slightly small one
+			// only misses the deepest crevice (and shows up in the miss stats).
+			const float fRaw = percentile(above, 0.95f);
+			const float rRaw = percentile(below, 0.95f);
+			const float f = fRaw * 1.1f + 0.0005f;
+			const float r = rRaw * 1.1f + 0.0005f;
+			out[low->getID()] =
+				vec2(Math::clamp(f, 0.002f, probeLen), Math::clamp(r, 0.002f, probeLen));
+			Log::message("Baker: cage probe \"%s\": frontal=%.4f rear=%.4f "
+						 "(range %.3f, samples %d/%d, median %.4f/%.4f)\n",
+				low->getName(), out[low->getID()].x, out[low->getID()].y, probeLen,
+				int(above.size()), int(below.size()),
+				percentile(above, 0.5f), percentile(below, 0.5f));
+		}
+	}
+	return out;
 }
 
 String createSkewMask(const Ptr<ObjectMeshStatic> &low, int size, String &error)

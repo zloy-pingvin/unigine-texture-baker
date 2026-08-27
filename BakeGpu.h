@@ -32,6 +32,19 @@ struct SurfaceCapture
 	// triangle k; (-1,-1) marks uncapturable charts (CPU fallback).
 	std::vector<Unigine::Math::vec2> atlasUV;
 
+	// Post-dilation coverage of the capture atlas: 1 = the texel holds real or
+	// gutter-filled chart data, 0 = untouched background.
+	// The background quad is BLACK, so pixel brightness cannot tell "this part
+	// of the mesh was never rasterized" from "the material is legitimately
+	// black" — only this mask can. Checked per hit: an uncovered texel means
+	// that piece of the mesh has no unwrap area at all (UVs collapsed to zero
+	// area), so it bakes from the material textures instead of reading
+	// background. Gutter-filled texels count as covered, so bilinear sampling
+	// at chart edges keeps working.
+	std::vector<unsigned char> coverage;
+	int coverageWidth = 0;
+	int coverageHeight = 0;
+
 	// legacy mapping (used only when atlasUV is empty): (uv - uvMin) / uvScale
 	Unigine::Math::vec2 uvMin{0.0f, 0.0f};
 	Unigine::Math::vec2 uvScale{1.0f, 1.0f};

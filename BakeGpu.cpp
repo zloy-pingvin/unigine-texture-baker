@@ -61,8 +61,14 @@ vec3 unpackGBufferNormal(const vec4 &rgba)
 // Rasterizes the surface triangles (positions per triangle CORNER, three
 // consecutive entries per triangle, in the unit square) into a per-texel claim
 // counter (saturating at 255).
+// minArea (in texels²) skips triangles too small for the GPU rasterizer to
+// produce any pixel. It matters when the mask is used as CAPTURE COVERAGE: the
+// inside test below is non-strict, so a triangle collapsed to zero area (a UV
+// set that simply has no unwrap for those faces) passes with all weights 0 and
+// would be reported as covered while the render drew nothing there. Left at 0
+// for the overlap metric, whose meaning does not change.
 static void rasterizeCounts(const std::vector<vec2> &pt,
-	int width, int height, std::vector<unsigned char> &cnt)
+	int width, int height, std::vector<unsigned char> &cnt, float minArea = 0.0f)
 {
 	cnt.assign(size_t(width) * size_t(height), 0);
 	for (int t = 0; t + 2 < int(pt.size()); t += 3)
@@ -73,6 +79,13 @@ static void rasterizeCounts(const std::vector<vec2> &pt,
 		vec2 p[3];
 		for (int k = 0; k < 3; k++)
 			p[k] = vec2(pt[t + k].x * float(width), pt[t + k].y * float(height));
+		if (minArea > 0.0f)
+		{
+			const float area2 = Math::abs((p[1].x - p[0].x) * (p[2].y - p[0].y)
+				- (p[1].y - p[0].y) * (p[2].x - p[0].x));
+			if (area2 * 0.5f < minArea)
+				continue;
+		}
 		int x0 = Math::clamp(int(Math::floor(Math::min(p[0].x, Math::min(p[1].x, p[2].x)))), 0, width - 1);
 		int x1 = Math::clamp(int(Math::ceil(Math::max(p[0].x, Math::max(p[1].x, p[2].x)))), 0, width - 1);
 		int y0 = Math::clamp(int(Math::floor(Math::min(p[0].y, Math::min(p[1].y, p[2].y)))), 0, height - 1);
@@ -116,6 +129,12 @@ struct ChartPack
 	int numCharts = 0;
 	int invalidTris = 0;  // triangles of degenerate/sub-texel charts (CPU fallback)
 	float overlap = 1.0f; // post-pack overlap: only chart-internal folds remain
+	// fraction of triangles that receive at least ~one texel of atlas area.
+	// A tiling/detail UV set can carry most of its triangles collapsed to
+	// (near) zero area: the capture then looks fine (a few big triangles cover
+	// the atlas) while every collapsed triangle has no pixels of its own and
+	// samples back as black background.
+	float usableFrac = 0.0f;
 	float scale = 0.0f;   // channel UV units -> atlas units
 };
 
@@ -393,6 +412,26 @@ static ChartPack buildChartPack(const Ptr<ConstMesh> &mesh, int surface, int cha
 			pack.atlasUV[i] = vec2((uv[i].x - uvMin.x) / span.x, (uv[i].y - uvMin.y) / span.y);
 	}
 
+	// how much of the surface actually gets capturable atlas area
+	{
+		int usable = 0, tris = 0;
+		const float sz = float(size);
+		for (int t = 0; t + 2 < numC; t += 3)
+		{
+			tris++;
+			if (pack.atlasUV[t].x < 0.0f)
+				continue; // uncapturable chart: CPU fallback, counted as unusable
+			vec2 a = pack.atlasUV[t] * sz;
+			vec2 b = pack.atlasUV[t + 1] * sz;
+			vec2 c = pack.atlasUV[t + 2] * sz;
+			const float area =
+				0.5f * Math::abs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x));
+			if (area >= 1.0f)
+				usable++;
+		}
+		pack.usableFrac = tris > 0 ? float(usable) / float(tris) : 0.0f;
+	}
+
 	// residual overlap of the packed layout (chart-internal folds only)
 	std::vector<unsigned char> cnt;
 	rasterizeCounts(pack.atlasUV, 256, 256, cnt);
@@ -415,10 +454,14 @@ static ChartPack buildChartPack(const Ptr<ConstMesh> &mesh, int surface, int cha
 // outward. Without this, bilinear sampling at a chart edge mixes in the black
 // render background — dark seam lines along every chart border.
 static void dilateCaptures(const std::vector<ImagePtr> &images,
-	const std::vector<vec2> &atlasUV, int width, int height)
+	const std::vector<vec2> &atlasUV, int width, int height,
+	std::vector<unsigned char> *outCoverage = nullptr)
 {
 	std::vector<unsigned char> mask;
-	rasterizeCounts(atlasUV, width, height, mask);
+	// half a texel: below that the GPU cannot cover a texel centre either, so
+	// such triangles must not be reported as captured (they would read
+	// background and bake black instead of falling back to the textures)
+	rasterizeCounts(atlasUV, width, height, mask, 0.5f);
 
 	static const int dx[8] = {1, -1, 0, 0, 1, 1, -1, -1};
 	static const int dy[8] = {0, 0, 1, -1, 1, -1, 1, -1};
@@ -458,6 +501,11 @@ static void dilateCaptures(const std::vector<ImagePtr> &images,
 		for (const Fill &f : fills)
 			mask[f.y * width + f.x] = 1;
 	}
+
+	// hand the final (chart + gutter) coverage to the caller: the bake needs it
+	// to tell background apart from a legitimately black material
+	if (outCoverage)
+		*outCoverage = std::move(mask);
 }
 
 PendingCapturePtr requestSurfaceCapture(const Ptr<ObjectMeshStatic> &obj, const Ptr<ConstMesh> &mesh,
@@ -500,6 +548,11 @@ PendingCapturePtr requestSurfaceCapture(const Ptr<ObjectMeshStatic> &obj, const 
 	{
 		if (!pk0.valid)
 			unwrapChannel = 1;
+		// a channel that collapses most of its triangles cannot be captured at
+		// all — those triangles have no pixels and sample back as background.
+		// This outweighs overlap and seam count.
+		else if (Math::abs(pk1.usableFrac - pk0.usableFrac) > 0.05f)
+			unwrapChannel = pk1.usableFrac > pk0.usableFrac ? 1 : 0;
 		else if (fabsf(pk1.overlap - pk0.overlap) < 0.02f)
 		{
 			// tie on overlap: fewer uncapturable triangles, then fewer seams
@@ -521,10 +574,13 @@ PendingCapturePtr requestSurfaceCapture(const Ptr<ObjectMeshStatic> &obj, const 
 
 	Unigine::Log::message(
 		"Baker: capture surface %d: unwrap in UV%d%s repacked (charts UV0=%d UV1=%d, "
-		"packed overlap UV0=%.1f%% UV1=%.1f%%, cpu-fallback tris=%d, scale=%.3f, colors=%d)\n",
+		"packed overlap UV0=%.1f%% UV1=%.1f%%, usable UV0=%.0f%% UV1=%.0f%%, "
+		"cpu-fallback tris=%d, scale=%.3f, colors=%d)\n",
 		surface, unwrapChannel, uvChannelMode >= 0 ? " [forced]" : "",
 		pk0.numCharts, pk1.numCharts,
 		pk0.valid ? pk0.overlap * 100.0f : -1.0f, pk1.valid ? pk1.overlap * 100.0f : -1.0f,
+		pk0.valid ? pk0.usableFrac * 100.0f : -1.0f,
+		pk1.valid ? pk1.usableFrac * 100.0f : -1.0f,
 		sel.invalidTris, sel.scale, numCol);
 
 	//--------------------------------------------------------------------------
@@ -737,18 +793,26 @@ PendingCapturePtr requestSurfaceCapture(const Ptr<ObjectMeshStatic> &obj, const 
 	Render::transferTextureToImage(
 		MakeCallback([pending](ImagePtr img) {
 			pending->albedo = img ? Image::create(img) : ImagePtr();
+			// the readback landed: drop the render target now instead of holding
+			// it until the end of the bake. Keeping one 3-buffer set per surface
+			// alive (163 surfaces x 873x873 x RGBA8 ~ 1.5 GB of VRAM) starves the
+			// renderer, and captures then come back holding another surface's
+			// render — the atlas and its packed coords no longer match.
+			pending->keepA = TexturePtr();
 			pending->arrived.fetch_add(1, std::memory_order_release);
 		}),
 		pending->keepA);
 	Render::transferTextureToImage(
 		MakeCallback([pending](ImagePtr img) {
 			pending->shading = img ? Image::create(img) : ImagePtr();
+			pending->keepS = TexturePtr();
 			pending->arrived.fetch_add(1, std::memory_order_release);
 		}),
 		pending->keepS);
 	Render::transferTextureToImage(
 		MakeCallback([pending](ImagePtr img) {
 			pending->normal = img ? Image::create(img) : ImagePtr();
+			pending->keepN = TexturePtr();
 			pending->arrived.fetch_add(1, std::memory_order_release);
 		}),
 		pending->keepN);
@@ -756,6 +820,7 @@ PendingCapturePtr requestSurfaceCapture(const Ptr<ObjectMeshStatic> &obj, const 
 		Render::transferTextureToImage(
 			MakeCallback([pending](ImagePtr img) {
 				pending->emission = img ? Image::create(img) : ImagePtr();
+				pending->keepE = TexturePtr();
 				pending->arrived.fetch_add(1, std::memory_order_release);
 			}),
 			pending->keepE);
@@ -838,7 +903,9 @@ SurfaceCapture finishCapture(const PendingCapturePtr &pending)
 		for (const ImagePtr &img : {albedo, shading, normal, emission})
 			if (img && img->getWidth() == w && img->getHeight() == h)
 				imgs.push_back(img);
-		dilateCaptures(imgs, pending->atlasUV, w, h);
+		dilateCaptures(imgs, pending->atlasUV, w, h, &result.coverage);
+		result.coverageWidth = w;
+		result.coverageHeight = h;
 	}
 
 	Log::message("Baker GPU: surface %d captured %dx%d (atlas points %d)\n",

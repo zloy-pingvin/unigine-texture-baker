@@ -8,6 +8,8 @@
 #include <QWidget>
 
 #include <chrono>
+#include <functional>
+#include <set>
 #include <vector>
 
 class QTimer;
@@ -23,6 +25,7 @@ class QMimeData;
 class QProgressBar;
 class QPushButton;
 class QTreeWidget;
+class QTreeWidgetItem;
 class QVBoxLayout;
 class QWidget;
 
@@ -45,6 +48,9 @@ private slots:
 	void cancelBake();
 	void onCaptureTick();
 	void onCreateSkewMask();
+	// probes every low-poly part and fills the per-part cage with the smallest
+	// distances that still catch its high-poly detail
+	void onAutoCage();
 
 private:
 	int grabSelectedMeshGroupId(QLabel *label);
@@ -110,6 +116,56 @@ private:
 	// parent node expands it into its meshes); resolved by ID at bake time
 	std::vector<int> highIds_;
 	std::vector<int> lowIds_;
+	// decal node IDs gathered from the high-poly hierarchy (projected onto the bake)
+	std::vector<int> decalIds_;
+
+	// EXPLICIT per-part cage overrides, keyed by low-poly node id. Each axis is
+	// independent: an unset axis follows the global spinbox, so changing the
+	// global value keeps hand-tuned axes untouched and still updates the rest.
+	struct PartCage
+	{
+		bool hasFrontal = false;
+		float frontal = 0.05f;
+		bool hasRear = false;
+		float rear = 0.05f;
+		bool any() const { return hasFrontal || hasRear; }
+	};
+	std::map<int, PartCage> partCage_;
+	// guards the tree's itemChanged handler while refreshMeshTree() fills cells
+	bool treeUpdating_ = false;
+	// Collapsed sections, by key ("high", "low", "decals", "g0hi", "g0lo", ...):
+	// refreshMeshTree() rebuilds the items from scratch, so the state has to live
+	// outside them, and groups mode has a variable number of sections.
+	std::set<QString> collapsedSections_;
+	// bake groups as used for a cage probe (no error plumbing: probing what can
+	// be resolved is enough)
+	std::vector<BakeCore::BakeGroup> buildProbeGroups() const;
+	// writes one low-poly row's cage cells: inherited values are dimmed, explicit
+	// ones bright, so it is visible at a glance which parts were tuned by hand
+	void fillCageCells(QTreeWidgetItem *item, int nodeId);
+	void resetAllPartCage();
+	// Visits the gathered decals by WALKING the high-poly hierarchy instead of
+	// looking them up by id: decals nested inside a Node Reference are not
+	// reachable through World::getNodeByID, which is why the bake walks the tree
+	// too. Only nodes already listed in decalIds_ are reported.
+	// The second argument is the Node Reference the decal lives inside, or null
+	// when it sits in the world directly — the engine renders a reference's
+	// content regardless of the inner node's own enabled flag, so hiding such a
+	// decal means toggling the reference.
+	void forEachHighDecal(
+		const std::function<void(const Unigine::NodePtr &, const Unigine::NodePtr &)> &fn) const;
+	// Every node of the high-poly hierarchy, descending into Node Reference
+	// contents (which World::getNodeByID cannot reach).
+	void forEachHighHierarchyNode(const std::function<void(const Unigine::NodePtr &)> &fn) const;
+
+	// how many high-poly surfaces a bake would capture with the current selection
+	int estimateCaptureSurfaces() const;
+	// The single place the capture-size policy lives, so the label under the
+	// window and the bake itself can never disagree. Returns the size in texels
+	// and, optionally, the numbers behind it.
+	int computeCaptureSize(int surfaceCount, double *outFreeBytes, double *outBudgetBytes,
+		bool *outManual) const;
+	void updateCaptureInfo();
 
 	bool baking_ = false;
 	bool cancelRequested_ = false;
@@ -131,6 +187,9 @@ private:
 		QGroupBox *box = nullptr;
 		QLabel *highLabel = nullptr;
 		QLabel *lowLabel = nullptr;
+		// same viewport-only toggles the single-mode slots have
+		QPushButton *hideHighButton = nullptr;
+		QPushButton *hideLowButton = nullptr;
 	};
 	std::vector<GroupRow> groupRows_;
 	// group mode combo: 0 = off (single pair), 1 = manual groups, 2 = by name
@@ -144,7 +203,6 @@ private:
 	QTreeWidget *meshTree_ = nullptr; // striped high/low participants list, drop target
 	QLineEdit *nameEdit_ = nullptr;   // output name for textures/material
 	QString lastAutoName_;            // last auto-suggested name (user edits win)
-	QToolButton *settingsRollout_ = nullptr; // collapsible Settings header
 	// the editor's "active tool" window (objectName "active_tool_window"),
 	// caught via WindowManager::windowShown — used to open the paint tool
 	QPointer<QWidget> activeToolWindow_;
@@ -154,6 +212,8 @@ private:
 	QComboBox *samplesCombo_ = nullptr;
 	QCheckBox *gpuCheck_ = nullptr;
 	QComboBox *captureUVCombo_ = nullptr;
+	QComboBox *captureSizeCombo_ = nullptr; // auto / 512 / 1024 / 2048
+	QLabel *captureInfoLabel_ = nullptr;    // resolved capture size + RAM estimate
 	QCheckBox *flipYCheck_ = nullptr;
 	QCheckBox *debugZonesCheck_ = nullptr;
 	QCheckBox *shadingRaysCheck_ = nullptr;
@@ -161,6 +221,10 @@ private:
 	QPushButton *skewMaskButton_ = nullptr;
 	QLabel *skewMaskHelp_ = nullptr;
 	QCheckBox *emissionCheck_ = nullptr;
+	QCheckBox *decalsCheck_ = nullptr;
+	QDoubleSpinBox *decalDistanceSpin_ = nullptr;
+	QPushButton *autoCageButton_ = nullptr;
+	QPushButton *resetCageButton_ = nullptr;
 	QPushButton *bakeButton_ = nullptr;
 	QPushButton *cancelButton_ = nullptr;
 	QProgressBar *progressBar_ = nullptr;

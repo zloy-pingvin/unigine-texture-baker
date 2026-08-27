@@ -114,12 +114,27 @@ target_link_libraries(${target}
 ##==============================================================================
 ## Target compiling options and properties.
 ##==============================================================================
+## Single source of truth for the version: Baker.json (the Qt plugin metadata
+## the editor reads). Parse it here so the UI cannot drift from the manifest.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/Baker.json" BAKER_MANIFEST)
+string(JSON BAKER_VERSION GET "${BAKER_MANIFEST}" "Version")
+message(STATUS "Baker plugin version: ${BAKER_VERSION}")
+
 target_compile_definitions(${target}
 	PRIVATE
 	$<$<BOOL:${UNIX}>:_LINUX>
 	$<$<BOOL:${UNIGINE_DOUBLE}>:UNIGINE_DOUBLE>
 	QT_NO_DEBUG
+	BAKER_VERSION="${BAKER_VERSION}"
+	## windows.h is needed to query free physical memory; without these its
+	## min/max macros and its huge include set break Qt and std headers
+	$<$<NOT:$<BOOL:${UNIX}>>:NOMINMAX>
+	$<$<NOT:$<BOOL:${UNIX}>>:WIN32_LEAN_AND_MEAN>
 	)
+
+## reconfigure when the manifest version changes
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+	"${CMAKE_CURRENT_SOURCE_DIR}/Baker.json")
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
 	set(UNIGINE_COMPILER_IS_MSVC TRUE)

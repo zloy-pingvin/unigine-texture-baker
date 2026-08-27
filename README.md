@@ -12,7 +12,10 @@ Typical use: baking full texture sets for simplified distant LODs of multi-mater
 - Multi-mesh high-poly and low-poly (parts share one UV layout and one texture set)
 - **Bake groups** (manual or auto-matched by name): rays of each low-poly part see only its own high-poly part
 - **Paintable skew mask** (Marmoset-style paint skew): one click creates the mask, assigns it and switches the editor into Texture Paint Mode
-- Frontal/rear cage distances, 1–64 samples per texel, edge dilation
+- **World decals** (Ortho/Proj/Mesh) are projected into the bake, including decals nested in Node References; disabled decals bake too
+- **Per-part cage**: every low-poly part can carry its own frontal/rear distance, edited in the front/back columns of the participants list. **Fit cage** probes each part with rays and picks the smallest distances that still catch its high-poly; the global pair is the ceiling, so one distant part no longer forces a big cage on the whole model
+- Frontal/rear cage distances, 4–64 samples per texel, edge dilation
+- **Emission** (`_e`): RGB is the glow colour, alpha is a glow mask (opaque where the material's Emission state is on) for compositing elsewhere
 - Baked textures are saved next to the low-poly asset; the material is created or updated automatically
 - Drag & drop from World Nodes; per-slot viewport Hide buttons that never affect baking
 - UI in English and Russian (follows the editor language)
@@ -32,18 +35,21 @@ The plugin is built inside a UNIGINE project (it needs the SDK's `include/` and 
 <project>/source/plugins/zloy_pingvin/Baker/   <- this repository
 ```
 
+Build **out of tree** — keep the build directory outside this folder, so packaging the
+plugin (e.g. a UNIGINE Store `.upackage` export) cannot pull build artifacts in.
+
 Windows (from a VS x64 developer prompt):
 
 ```bat
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=C:/Qt/6.5.3/msvc2019_64
-cmake --build build
+cmake -S . -B %USERPROFILE%/baker_build/win_x64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=C:/Qt/6.5.3/msvc2019_64
+cmake --build %USERPROFILE%/baker_build/win_x64
 ```
 
 Linux:
 
 ```sh
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/qt/6.5.3/gcc_64
-cmake --build build
+cmake -S . -B ~/baker_build/x64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/qt/6.5.3/gcc_64
+cmake --build ~/baker_build/x64
 ```
 
 Options:
@@ -62,7 +68,9 @@ Copy `bin/plugins/zloy_pingvin/Baker/` into your project's `bin` folder (keep th
 
 - Open the tool: menu Windows -> Texture Baker
 - Select the high-poly node in the scene and press Select (or drag nodes from World Nodes onto the High-poly section). Same for the low-poly.
-- Pick the output resolution; adjust the frontal/rear distances in Settings if needed.
+- Pick the output resolution; set the global cage (front/back). It is both the default for every part and the ceiling for Fit cage.
+- Optional: press Fit cage to tighten the cage per part, then adjust single values in the front/back columns of the low-poly rows.
+A dimmed value follows the global one; an empty field resets that axis back to it.
 - Press Bake. Textures are saved next to the low-poly mesh asset; the material is created/updated automatically.
 - If details bake with a sideways slide, press Paint skew mask, paint the problem areas white, save, enable "use skew mask" and re-bake. 
 If a neighboring part imprints onto another one, use Groups (manual pairs or by-name matching).
@@ -76,8 +84,12 @@ If a neighboring part imprints onto another one, use Groups (manual pairs or by-
 
 - As rendered (GPU) - the main bake mode: the engine renders the high-poly materials into the capture (layers, masks, tiling, colors). 
 Disable to sample only the base material textures on the CPU (faster, but layered materials lose their layers).
-- Capture unwrap (auto / UV0 / UV1) - which UV channel the GPU capture unwraps the high-poly into. Auto picks the channel with less chart overlap per surface (the choice is logged to the console). 
+- Capture unwrap (auto / UV0 / UV1) - which UV channel the GPU capture unwraps the high-poly into. Auto prefers the channel where more triangles actually receive atlas area 
+(a tiling UV set often collapses part of the mesh to zero area, which renders nothing); ties go to less chart overlap, then fewer charts. The choice is logged to the console. 
 Change only if a second-UV-driven layer bakes wrong.
+- Capture size (auto / 512 / 1024 / 2048) - the GPU capture size per high-poly surface. It caps the detail of the "as rendered" mode regardless of the bake resolution, 
+so baking at 4096 gains little if the capture is smaller. Auto divides a budget of 50% of free RAM (16 GB max) by the surface count; a manual size ignores that budget, 
+and if RAM runs short the captures come back black and those surfaces bake from the material textures instead. The resolved size and its RAM usage are shown at the bottom of the window.
 - Invert G (Y) - extra inversion of the normal map green channel. Normally not needed; enable only if the baked relief looks inverted.
 - Colorize hit zones - bakes a diagnostic colorization instead of albedo: green - the ray hit a surface above the low-poly, blue - below, red - a back face, yellow - the skew mask area, 
 black/stretched - a miss. Also dumps the GPU capture atlases to the system temp folder (baker_captures) for inspection.
