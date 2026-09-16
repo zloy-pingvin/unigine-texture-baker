@@ -100,6 +100,19 @@ private:
 	std::vector<IdGroup> bakeGroupIds_;
 	std::vector<BakeGpu::PendingCapturePtr> pending_;
 	std::vector<BakeGpu::SurfaceCapture> captures_;
+	// Captures run in CHUNKS: every pending capture holds its render targets
+	// resident on the GPU until the readback lands, so issuing all of them at
+	// once makes peak video memory grow with the surface count — which is what
+	// resets the device on large models. A chunk is collected and released
+	// before the next one is issued, so the peak is bounded by captureChunk_
+	// and no longer depends on how many surfaces the model has.
+	size_t captureCursor_ = 0; // next entry of captureItems_ to request
+	int captureChunk_ = 0;     // max captures in flight at once
+	// Share of the progress bar the capture phase owns, in percent. Capturing a
+	// big model takes many chunks and used to leave the bar sitting at zero the
+	// whole time, which reads as a hang; the ray tracing that follows is then
+	// mapped onto the remaining span.
+	int progressBase_ = 0;
 	bool captureStarted_ = false;
 	bool captureKicked_ = false;
 	// warm-up render pass before the real captures: triggers texture streaming
@@ -160,11 +173,22 @@ private:
 
 	// how many high-poly surfaces a bake would capture with the current selection
 	int estimateCaptureSurfaces() const;
+	// What the capture-size decision was based on, for the label under the window
+	// and for the bake log.
+	struct CaptureBudget
+	{
+		double ramFree = 0.0;     // bytes reported free by the OS
+		double ramBudget = 0.0;   // bytes the capture set may occupy in system RAM
+		double vramFree = 0.0;    // bytes; 0 when the engine reported nothing
+		double vramBudget = 0.0;  // bytes the capture set may occupy in video memory
+		int chunk = 0;            // how many captures may be in flight at once
+		bool manual = false;      // size forced in the Debug tab, no budgeting done
+		bool vramLimited = false; // a single capture did not fit, so the size was cut
+	};
 	// The single place the capture-size policy lives, so the label under the
 	// window and the bake itself can never disagree. Returns the size in texels
 	// and, optionally, the numbers behind it.
-	int computeCaptureSize(int surfaceCount, double *outFreeBytes, double *outBudgetBytes,
-		bool *outManual) const;
+	int computeCaptureSize(int surfaceCount, CaptureBudget *outBudget = nullptr) const;
 	void updateCaptureInfo();
 
 	bool baking_ = false;
@@ -220,6 +244,10 @@ private:
 	QCheckBox *skewMaskCheck_ = nullptr;
 	QPushButton *skewMaskButton_ = nullptr;
 	QLabel *skewMaskHelp_ = nullptr;
+	// per-map write switches; an unchecked map keeps the texture it already has
+	QCheckBox *albedoCheck_ = nullptr;
+	QCheckBox *shadingCheck_ = nullptr;
+	QCheckBox *normalCheck_ = nullptr;
 	QCheckBox *emissionCheck_ = nullptr;
 	QCheckBox *decalsCheck_ = nullptr;
 	QDoubleSpinBox *decalDistanceSpin_ = nullptr;

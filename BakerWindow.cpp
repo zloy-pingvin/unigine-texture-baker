@@ -14,6 +14,7 @@
 #include <UnigineLog.h>
 #include <UnigineObjects.h>
 #include <UnigineRender.h>
+#include <UnigineSystemInfo.h>
 #include <UnigineNodes.h>
 #include <UnigineWorld.h>
 
@@ -89,6 +90,23 @@ static double availablePhysicalMemory()
 	}
 #endif
 	return 0.0;
+}
+
+// Video memory the capture set may draw on. This is the limit that actually
+// gets hit: performCaptures() issues EVERY surface before collecting any of
+// them, and each pending capture holds its render targets resident until the
+// readback lands, so the whole set is alive on the GPU at once.
+static double availableVideoMemory()
+{
+	const double free = double(Unigine::SystemInfo::getGpuVRamFree());
+	// the driver's budget for this process can sit below the card's free memory
+	// (shared/laptop GPUs especially); whichever is smaller is the real ceiling
+	const double budget = double(Unigine::SystemInfo::getGpuVRamBudget());
+	const double usage = double(Unigine::SystemInfo::getGpuVRamUsage());
+	double avail = free;
+	if (budget > 0.0 && budget - usage < avail)
+		avail = budget - usage;
+	return avail > 0.0 ? avail : 0.0;
 }
 
 // The editor has no API to query its UI language: read its own config
@@ -533,8 +551,29 @@ BakerWindow::BakerWindow(QWidget *parent)
 	skewMaskButton_->setVisible(skewMaskCheck_->isChecked());
 	connect(skewMaskCheck_, &QCheckBox::toggled, skewMaskButton_, &QWidget::setVisible);
 
-	emissionCheck_ = new QCheckBox(tr2("запекать emissive (_e)", "bake emissive (_e)"));
-	emissionCheck_->setChecked(false);
+	// Which maps the bake writes. Unchecking one leaves the existing texture
+	// alone, so a map that came out wrong can be re-baked on its own.
+	albedoCheck_ = new QCheckBox(tr2("альбедо (_alb)", "albedo (_alb)"));
+	shadingCheck_ = new QCheckBox(tr2("шейдинг (_sh)", "shading (_sh)"));
+	normalCheck_ = new QCheckBox(tr2("нормаль (_n)", "normal (_n)"));
+	emissionCheck_ = new QCheckBox(tr2("emissive (_e)", "emissive (_e)"));
+	albedoCheck_->setChecked(true);
+	shadingCheck_->setChecked(true);
+	normalCheck_->setChecked(true);
+	emissionCheck_->setChecked(false); // off by default: most models do not glow
+	const QString mapsTip = tip2(
+		"Какие карты записывать. Снятая галочка - карта не перезаписывается,\n"
+		"у материала остаётся прежняя текстура. Так можно перепечь одну карту\n"
+		"отдельным проходом, не трогая остальные.\n"
+		"Трассировка лучей идёт целиком в любом случае - карты считаются за один проход,\n"
+		"так что отключение карты экономит не время, а только перезапись файла.",
+		"Which maps to write. An unchecked map is not overwritten and the material keeps\n"
+		"its current texture, so one map can be re-baked on its own without touching the rest.\n"
+		"Ray tracing still runs in full either way - the maps share one traversal - so\n"
+		"leaving a map out saves the file rewrite, not the bake time.");
+	albedoCheck_->setToolTip(mapsTip);
+	shadingCheck_->setToolTip(mapsTip);
+	normalCheck_->setToolTip(mapsTip);
 	emissionCheck_->setToolTip(tip2(
 		"Запекает текстуру свечения (_e) и включает стейт Emission у материала low-poly.\n"
 		"RGB - цвет свечения, альфа - маска: 1 где стейт Emission включён, 0 где выключен.\n"
@@ -542,7 +581,20 @@ BakerWindow::BakerWindow(QWidget *parent)
 		"Bakes the emission texture (_e) and enables the Emission state on the low-poly material.\n"
 		"RGB = glow colour, alpha = mask: 1 where the Emission state is on, 0 where off.\n"
 		"mesh_base uses RGB only."));
-	settingsLayout->addRow(tr2("Emissive:", "Emissive:"), emissionCheck_);
+	{
+		QWidget *maps = new QWidget();
+		QHBoxLayout *mapsLayout = new QHBoxLayout(maps);
+		mapsLayout->setContentsMargins(0, 0, 0, 0);
+		mapsLayout->addWidget(albedoCheck_);
+		mapsLayout->addWidget(shadingCheck_);
+		mapsLayout->addWidget(normalCheck_);
+		mapsLayout->addWidget(emissionCheck_);
+		mapsLayout->addStretch();
+		settingsLayout->addRow(tr2("Карты:", "Maps:"), maps);
+	}
+	// the emission pass adds a fourth render target per surface, so the capture
+	// budget (and the size it resolves to) changes with this checkbox
+	connect(emissionCheck_, &QCheckBox::toggled, this, [this](bool) { updateCaptureInfo(); });
 
 	decalsCheck_ = new QCheckBox(tr2("запекать декали", "bake decals"));
 	decalsCheck_->setChecked(false);
@@ -726,9 +778,12 @@ BakerWindow::BakerWindow(QWidget *parent)
 #define BAKER_VERSION "dev"
 #endif
 	const QString fullVersion = QString::fromLatin1(BAKER_VERSION);
-	// the manifest carries the 4-part Qt plugin form ("0.5.0.0"); show major.minor
-	const QString shortVersion = fullVersion.count('.') >= 1
-		? fullVersion.section('.', 0, 1)
+	// The manifest carries the 4-part Qt plugin form ("0.5.5.0"); show
+	// major.minor.patch. Releases differ in the PATCH digit, so cutting the
+	// label down to major.minor made every 0.5.x build read "v0.5" and left the
+	// real version visible only in the tooltip.
+	const QString shortVersion = fullVersion.count('.') >= 2
+		? fullVersion.section('.', 0, 2)
 		: fullVersion;
 	auto aboutLabel = new QLabel(
 		QString("<span style=\"color:#9a9a9a;\">Texture Baker v%1 by zloy_pingvin</span>&nbsp;&nbsp;")
@@ -771,6 +826,9 @@ void BakerWindow::saveSettings() const
 	s.setValue("rear", rearSpin_->value());
 	s.setValue("samples", samplesCombo_->currentData().toInt());
 	s.setValue("use_skew_mask", skewMaskCheck_->isChecked());
+	s.setValue("bake_albedo", albedoCheck_->isChecked());
+	s.setValue("bake_shading", shadingCheck_->isChecked());
+	s.setValue("bake_normal", normalCheck_->isChecked());
 	s.setValue("bake_emission", emissionCheck_->isChecked());
 	s.setValue("bake_decals", decalsCheck_->isChecked());
 	s.setValue("decal_distance", decalDistanceSpin_->value());
@@ -796,6 +854,9 @@ void BakerWindow::restoreSettings()
 	if (idx >= 0)
 		samplesCombo_->setCurrentIndex(idx);
 	skewMaskCheck_->setChecked(s.value("use_skew_mask", true).toBool());
+	albedoCheck_->setChecked(s.value("bake_albedo", true).toBool());
+	shadingCheck_->setChecked(s.value("bake_shading", true).toBool());
+	normalCheck_->setChecked(s.value("bake_normal", true).toBool());
 	emissionCheck_->setChecked(s.value("bake_emission", false).toBool());
 	decalsCheck_->setChecked(s.value("bake_decals", false).toBool());
 	decalDistanceSpin_->setValue(s.value("decal_distance", 1.0).toDouble());
@@ -1538,6 +1599,9 @@ void BakerWindow::setUiLocked(bool locked)
 	debugZonesCheck_->setEnabled(!locked);
 	shadingRaysCheck_->setEnabled(!locked);
 	skewMaskCheck_->setEnabled(!locked);
+	albedoCheck_->setEnabled(!locked);
+	shadingCheck_->setEnabled(!locked);
+	normalCheck_->setEnabled(!locked);
 	emissionCheck_->setEnabled(!locked);
 	decalsCheck_->setEnabled(!locked);
 	decalDistanceSpin_->setEnabled(!locked);
@@ -1779,25 +1843,39 @@ int BakerWindow::estimateCaptureSurfaces() const
 	return n;
 }
 
-int BakerWindow::computeCaptureSize(int surfaceCount, double *outFreeBytes,
-	double *outBudgetBytes, bool *outManual) const
+int BakerWindow::computeCaptureSize(int surfaceCount, CaptureBudget *outBudget) const
 {
-	// per surface and per texel: 3 RGBA8 gbuffer images + 1 coverage byte
+	// per surface and per texel in SYSTEM RAM: 3 RGBA8 gbuffer images read back
+	// from the GPU + 1 coverage byte
 	const double bytesPerTexel = 3.0 * 4.0 + 1.0;
-	const double freeBytes = availablePhysicalMemory();
-	if (outFreeBytes)
-		*outFreeBytes = freeBytes;
+	// ...and in VIDEO memory: one RGBA8 render target per gbuffer image, plus a
+	// fourth one when the emission pass is on.
+	//
+	// The x2 is a deliberate safety factor, not arithmetic. Rendering a surface
+	// needs more GPU memory than the targets this plugin reads back: the engine
+	// allocates its own depth buffer and intermediate gbuffer for the pass. A
+	// field report pins the scale — 112 surfaces at 2048 (5.6 GB by the bare
+	// count, on a card with ~9 GB free) reset the device, while 112 at 1024
+	// completed. So the bare count understates the real cost by roughly this
+	// much, and the estimate has to carry it or auto-sizing walks into the same
+	// crash. Replace it with a measurement once the before/after VRAM numbers
+	// logged around the capture loop come back from a large bake.
+	const bool emission = emissionCheck_ && emissionCheck_->isChecked();
+	const double bytesPerTexelVram = (emission ? 4.0 : 3.0) * 4.0 * 2.0;
+
+	CaptureBudget b;
+	b.ramFree = availablePhysicalMemory();
+	b.vramFree = availableVideoMemory();
 
 	int size = resolutionCombo_ ? resolutionCombo_->currentData().toInt() : 2048;
 	size = size < 512 ? 512 : (size > 2048 ? 2048 : size);
 
 	const int forced = captureSizeCombo_ ? captureSizeCombo_->currentData().toInt() : -1;
-	if (outManual)
-		*outManual = forced > 0;
+	b.manual = forced > 0;
 	if (forced > 0)
 	{
-		if (outBudgetBytes)
-			*outBudgetBytes = 0.0;
+		if (outBudget)
+			*outBudget = b;
 		return forced;
 	}
 
@@ -1805,16 +1883,46 @@ int BakerWindow::computeCaptureSize(int surfaceCount, double *outFreeBytes,
 	// constant is wrong in both directions: it wastes resolution on a big box and
 	// thrashes on a small one. Half of the free physical memory leaves room for
 	// the bake accumulators, the output images and the editor itself.
-	double budget = freeBytes > 0.0 ? freeBytes * 0.5 : 1.5e9;
-	budget = qBound(1.0e9, budget, 16.0e9);
-	if (outBudgetBytes)
-		*outBudgetBytes = budget;
+	b.ramBudget = qBound(1.0e9, b.ramFree > 0.0 ? b.ramFree * 0.5 : 1.5e9, 16.0e9);
+	// Video memory gets its own, tighter share. Overrunning RAM only makes the
+	// bake slow; overrunning VRAM resets the device (HRESULT 0x887A0007) and
+	// takes the editor down with it, so leave the renderer a wide margin. Free
+	// VRAM already excludes the loaded scene, which is what has to keep fitting.
+	b.vramBudget = b.vramFree > 0.0 ? b.vramFree * 0.5 : 0.0;
+
+	// System RAM holds every finished capture for the whole bake, so it is what
+	// caps the SIZE — the full set has to fit at once and chunking cannot help.
 	if (surfaceCount > 0)
 	{
-		const int maxSize = int(std::sqrt(budget / (double(surfaceCount) * bytesPerTexel)));
+		const int maxSize = int(std::sqrt(b.ramBudget / (double(surfaceCount) * bytesPerTexel)));
 		if (maxSize < size)
 			size = maxSize < 256 ? 256 : maxSize;
 	}
+
+	// Video memory, by contrast, only has to hold the captures still in flight,
+	// and performCaptures() issues them a chunk at a time. So VRAM sets HOW MANY
+	// run together rather than how big they are, and a small GPU costs extra
+	// passes instead of quality. It can still force the size down, but only in
+	// the one case chunking cannot fix: a single capture that does not fit.
+	const double oneCapture = double(size) * double(size) * bytesPerTexelVram;
+	if (b.vramBudget > 0.0 && oneCapture > b.vramBudget)
+	{
+		const int maxSize = int(std::sqrt(b.vramBudget / bytesPerTexelVram));
+		size = maxSize < 256 ? 256 : maxSize;
+		b.vramLimited = true;
+	}
+	if (b.vramBudget > 0.0)
+	{
+		const double fit = b.vramBudget / (double(size) * double(size) * bytesPerTexelVram);
+		b.chunk = fit < 1.0 ? 1 : int(fit);
+	}
+	else
+		b.chunk = 16; // no VRAM reading: a conservative fixed chunk
+	if (surfaceCount > 0 && b.chunk > surfaceCount)
+		b.chunk = surfaceCount;
+
+	if (outBudget)
+		*outBudget = b;
 	return size;
 }
 
@@ -1837,18 +1945,32 @@ void BakerWindow::updateCaptureInfo()
 			tr2("Захват: модели не выбраны.", "Capture: no models set."));
 		return;
 	}
-	double freeBytes = 0.0, budget = 0.0;
-	bool manual = false;
-	const int size = computeCaptureSize(n, &freeBytes, &budget, &manual);
-	const double useGb = double(n) * double(size) * double(size) * 13.0 / 1e9;
-	captureInfoLabel_->setText(
-		tr2("Захват: %1×%1 на поверхность × %2 поверхн. ≈ %3 ГБ ОЗУ (%4, свободно %5 ГБ)",
-			"Capture: %1x%1 per surface x %2 surfaces = %3 GB RAM (%4, %5 GB free)")
-			.arg(size)
-			.arg(n)
-			.arg(useGb, 0, 'f', 1)
-			.arg(manual ? tr2("вручную", "manual") : tr2("авто", "auto"))
-			.arg(freeBytes / 1e9, 0, 'f', 1));
+	CaptureBudget b;
+	const int size = computeCaptureSize(n, &b);
+	const double texels = double(n) * double(size) * double(size);
+	const double useGb = texels * 13.0 / 1e9;
+	const bool emission = emissionCheck_ && emissionCheck_->isChecked();
+	const int chunk = b.chunk > 0 ? b.chunk : 1;
+	const double peakVram
+		= double(chunk) * double(size) * double(size) * (emission ? 32.0 : 24.0) / 1e9;
+	QString text
+		= tr2("Захват: %1×%1 × %2 поверхн. ≈ %3 ГБ ОЗУ; по %4 за раз ≈ %5 ГБ видеопамяти "
+			  "(%6; свободно: ОЗУ %7 ГБ, видео %8 ГБ)",
+			"Capture: %1x%1 x %2 surfaces = %3 GB RAM; %4 at a time = %5 GB VRAM "
+			"(%6; free: RAM %7 GB, VRAM %8 GB)")
+			  .arg(size)
+			  .arg(n)
+			  .arg(useGb, 0, 'f', 1)
+			  .arg(chunk)
+			  .arg(peakVram, 0, 'f', 1)
+			  .arg(b.manual ? tr2("вручную", "manual") : tr2("авто", "auto"))
+			  .arg(b.ramFree / 1e9, 0, 'f', 1)
+			  .arg(b.vramFree / 1e9, 0, 'f', 1);
+	// only says this in the one case chunking cannot absorb — a single capture
+	// too big for the GPU — so a reduced size never looks unexplained
+	if (b.vramLimited)
+		text += tr2(" — размер урезан под видеопамять", " - size cut to fit video memory");
+	captureInfoLabel_->setText(text);
 }
 
 void BakerWindow::resetAllPartCage()
@@ -1957,6 +2079,16 @@ void BakerWindow::startBake()
 {
 	if (baking_)
 		return;
+
+	// with every map unchecked the bake would trace the whole model and write
+	// nothing, which looks like a failure rather than an empty selection
+	if (!albedoCheck_->isChecked() && !shadingCheck_->isChecked() && !normalCheck_->isChecked()
+		&& !emissionCheck_->isChecked())
+	{
+		statusLabel_->setText(
+			tr2("Не выбрана ни одна карта.", "No maps selected."));
+		return;
+	}
 
 	// resolve the bake groups (single mode = one implicit group).
 	// baking a mesh onto itself is allowed: it is a useful null-test
@@ -2101,6 +2233,9 @@ void BakerWindow::startBake()
 	settings_.debugZones = debugZonesCheck_->isChecked();
 	settings_.raysAlongShading = shadingRaysCheck_->isChecked();
 	settings_.useSkewMask = skewMaskCheck_->isChecked();
+	settings_.bakeAlbedo = albedoCheck_->isChecked();
+	settings_.bakeShading = shadingCheck_->isChecked();
+	settings_.bakeNormal = normalCheck_->isChecked();
 	settings_.bakeEmission = emissionCheck_->isChecked();
 	settings_.bakeDecals = decalsCheck_->isChecked();
 	settings_.decalNodeIds = decalsCheck_->isChecked() ? decalIds_ : std::vector<int>();
@@ -2111,6 +2246,7 @@ void BakerWindow::startBake()
 	cancelRequested_ = false;
 	setUiLocked(true);
 	progressBar_->setValue(0);
+	progressBase_ = 0; // CPU mode: ray tracing owns the whole bar
 
 	pending_.clear();
 	captures_.clear();
@@ -2145,20 +2281,34 @@ void BakerWindow::startBake()
 		{
 			// Every captured surface holds 3 images (albedo/shading/normal) at
 			// captureSize² AND a GPU texture set of the same size in flight, so
-			// the size is budgeted against free RAM (or forced in the Debug tab).
-			// One shared policy with the label under the window, so what the user
-			// reads there is exactly what the bake uses.
+			// the size is budgeted against free RAM *and* free video memory (or
+			// forced in the Debug tab). One shared policy with the label under
+			// the window, so what the user reads there is exactly what the bake
+			// uses.
 			{
 				const int n = int(captureItems_.size());
-				double freeBytes = 0.0, budgetBytes = 0.0;
-				bool manual = false;
-				captureSize_ = computeCaptureSize(n, &freeBytes, &budgetBytes, &manual);
+				CaptureBudget b;
+				captureSize_ = computeCaptureSize(n, &b);
+				captureChunk_ = b.chunk > 0 ? b.chunk : 1;
+				captureCursor_ = 0;
+				progressBase_ = 10;
+				// sized for the whole bake up front; the chunks fill it in place
+				int maxFlat = -1;
+				for (const CaptureItem &it : captureItems_)
+					maxFlat = std::max(maxFlat, it.flatIndex);
+				captures_.assign(size_t(maxFlat) + 1, BakeGpu::SurfaceCapture());
+				const double texels = double(n) * double(captureSize_) * double(captureSize_);
+				const double perTexelVram = settings_.bakeEmission ? 32.0 : 24.0;
 				Unigine::Log::message(
-					"Baker: %d surfaces to capture, capture size = %d (%s, free RAM %.1f GB, "
-					"budget %.1f GB, estimated capture set %.1f GB)\n",
-					n, captureSize_, manual ? "manual" : "auto", freeBytes / 1e9,
-					budgetBytes / 1e9,
-					double(n) * double(captureSize_) * double(captureSize_) * 13.0 / 1e9);
+					"Baker: %d surfaces to capture, capture size = %d (%s%s, free RAM %.1f GB "
+					"-> budget %.1f GB, free VRAM %.1f GB -> budget %.1f GB), %.1f GB RAM for "
+					"the whole set, %d capture(s) per chunk = %.2f GB VRAM peak\n",
+					n, captureSize_, b.manual ? "manual" : "auto",
+					b.vramLimited ? ", size cut to fit VRAM" : "", b.ramFree / 1e9,
+					b.ramBudget / 1e9, b.vramFree / 1e9, b.vramBudget / 1e9, texels * 13.0 / 1e9,
+					captureChunk_,
+					double(captureChunk_) * double(captureSize_) * double(captureSize_)
+						* perTexelVram / 1e9);
 			}
 			captureStarted_ = false;
 			captureKicked_ = false;
@@ -2197,12 +2347,18 @@ void BakerWindow::performCaptures()
 		const Render::SHADERS_COMPILE_MODE prevCompileMode = Render::getShadersCompileMode();
 		Render::setForceStreaming(true);
 		Render::setShadersCompileMode(Render::SHADERS_COMPILE_MODE_FORCE);
+		// Streaming and shader compilation do not care how big the target is, so
+		// warm up at a small size: at the real capture size this pass allocates a
+		// render target set for EVERY surface before a single frame is drawn to
+		// release them, which is a memory spike as bad as the captures it exists
+		// to protect.
+		const int warmupSize = captureSize_ < 256 ? captureSize_ : 256;
 		for (const CaptureItem &item : captureItems_)
 		{
 			Ptr<ObjectMeshStatic> obj = checked_ptr_cast<ObjectMeshStatic>(World::getNodeByID(item.objectId));
 			Ptr<ConstMesh> mesh = obj ? obj->getMeshForceRAM() : Ptr<ConstMesh>();
 			if (mesh)
-				BakeGpu::requestSurfaceCapture(obj, mesh, item.surface, captureSize_, captureUVMode_);
+				BakeGpu::requestSurfaceCapture(obj, mesh, item.surface, warmupSize, captureUVMode_);
 		}
 		Render::setShadersCompileMode(prevCompileMode);
 		Render::setForceStreaming(prevForceStreaming);
@@ -2216,13 +2372,24 @@ void BakerWindow::performCaptures()
 
 	captureStarted_ = true;
 
+	// Measure what the capture set actually costs on the GPU. computeCaptureSize()
+	// can only estimate it, and the estimate is what stands between a big scene
+	// and a device reset — these two numbers are how the estimate gets corrected.
+	const double vramBefore = double(Unigine::SystemInfo::getGpuVRamUsage());
+
 	const bool prevForceStreaming = Render::isForceStreaming();
 	const Render::SHADERS_COMPILE_MODE prevCompileMode = Render::getShadersCompileMode();
 	Render::setForceStreaming(true);
 	Render::setShadersCompileMode(Render::SHADERS_COMPILE_MODE_FORCE);
 
-	for (const CaptureItem &item : captureItems_)
+	// one chunk only: the rest is issued after this one has been collected and
+	// its GPU memory released (see onCaptureTick)
+	const size_t chunkEnd
+		= std::min(captureItems_.size(), captureCursor_ + size_t(captureChunk_ > 0 ? captureChunk_ : 1));
+	const size_t chunkBegin = captureCursor_;
+	for (size_t i = chunkBegin; i < chunkEnd; i++)
 	{
+		const CaptureItem &item = captureItems_[i];
 		Ptr<ObjectMeshStatic> obj = checked_ptr_cast<ObjectMeshStatic>(World::getNodeByID(item.objectId));
 		Ptr<ConstMesh> mesh = obj ? obj->getMeshForceRAM() : Ptr<ConstMesh>();
 		if (!mesh)
@@ -2238,13 +2405,26 @@ void BakerWindow::performCaptures()
 			Unigine::Log::warning("Baker: GPU capture request failed for \"%s\" surface %d\n",
 				obj->getName(), item.surface);
 	}
+	captureCursor_ = chunkEnd;
 	// each render's swap delivers the previous render's readbacks;
 	// a final dummy render flushes the last one
-	if (!captureItems_.empty())
+	if (chunkEnd > chunkBegin)
 		BakeGpu::flushTransfers();
 
 	Render::setShadersCompileMode(prevCompileMode);
 	Render::setForceStreaming(prevForceStreaming);
+
+	{
+		const double used = double(Unigine::SystemInfo::getGpuVRamUsage()) - vramBefore;
+		const double texels
+			= double(pending_.size()) * double(captureSize_) * double(captureSize_);
+		Unigine::Log::message(
+			"Baker: chunk %d-%d of %d in flight at %d, VRAM usage +%.2f GB (%.1f bytes/texel "
+			"measured), %.2f GB still free\n",
+			int(chunkBegin), int(chunkEnd) - 1, int(captureItems_.size()), captureSize_,
+			used / 1e9, texels > 0.0 ? used / texels : 0.0,
+			double(Unigine::SystemInfo::getGpuVRamFree()) / 1e9);
+	}
 
 	captureKicked_ = true;
 }
@@ -2274,6 +2454,14 @@ void BakerWindow::onCaptureTick()
 	// still waiting for the end-of-render event to fire
 	if (!captureKicked_)
 	{
+		// Before the first chunk this covers the warm-up pass, which renders
+		// every surface once to trigger texture streaming and shader
+		// compilation — seconds of apparent silence on a big model. Between
+		// chunks the bar already stands where the last chunk left it, so it is
+		// left alone rather than reset.
+		if (captureCursor_ == 0 && progressBase_ > 0)
+			statusLabel_->setText(tr2("Подготовка: стриминг текстур и компиляция шейдеров...",
+				"Warming up: texture streaming and shader compilation..."));
 		if (deadlinePassed)
 		{
 			engineConns_.disconnectAll();
@@ -2291,15 +2479,32 @@ void BakerWindow::onCaptureTick()
 			readyCount++;
 	const bool allReady = readyCount == int(pending_.size());
 
+	// Move the bar on every tick, not once per chunk: within a chunk the
+	// readbacks land one by one, and a bar that only steps between chunks still
+	// looks stuck on a model with few, large chunks.
+	if (!captureItems_.empty() && progressBase_ > 0)
+	{
+		const int collected = int(captureCursor_) - int(pending_.size()) + readyCount;
+		progressBar_->setValue(collected * progressBase_ / int(captureItems_.size()));
+		statusLabel_->setText(tr2("Захват материалов (GPU): %1 из %2...",
+			"Capturing materials (GPU): %1 of %2...")
+								  .arg(collected)
+								  .arg(captureItems_.size()));
+	}
+
 	if (!allReady && !deadlinePassed)
 		return;
 
 	captureTimer_->stop();
 
+	// captures_ spans every surface of the bake and is filled across chunks, so
+	// it is grown here rather than re-assigned — assigning per chunk would drop
+	// everything the earlier chunks collected
 	int maxSurface = -1;
 	for (const auto &p : pending_)
 		maxSurface = std::max(maxSurface, p->surface);
-	captures_.assign(maxSurface + 1, BakeGpu::SurfaceCapture());
+	if (int(captures_.size()) < maxSurface + 1)
+		captures_.resize(maxSurface + 1);
 
 	int ready = 0, timedOut = 0;
 	for (const auto &p : pending_)
@@ -2318,7 +2523,26 @@ void BakerWindow::onCaptureTick()
 	Unigine::Log::message("Baker: captures ready=%d, timed out=%d (timed-out surfaces bake from "
 						  "the base material on the CPU)\n",
 		ready, timedOut);
+	// releases this chunk's GPU targets — the whole point of chunking, and it
+	// has to happen before the next chunk is requested
 	pending_.clear();
+
+	// more surfaces left: hand control back to the engine so the released
+	// targets are actually recycled, then issue the next chunk the same way the
+	// first one was issued
+	if (captureCursor_ < captureItems_.size())
+	{
+		captureStarted_ = false;
+		captureKicked_ = false;
+		// the status text and the bar are updated on every tick above
+		engineConns_.disconnectAll();
+		Engine::get()->getEventEndUpdate().connect(engineConns_, [this]() { performCaptures(); });
+		// same allowance the first chunk gets, and a chunk is smaller than the
+		// whole set used to be
+		captureDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(25);
+		captureTimer_->start();
+		return;
+	}
 
 	// diagnostic dump of the capture atlases (shares the debug zones checkbox)
 	if (debugZonesCheck_->isChecked())
@@ -2367,7 +2591,8 @@ void BakerWindow::runBake()
 	settings_.gpuCaptures = &captures_;
 
 	auto progress = [this](int percent, const char *text) -> bool {
-		progressBar_->setValue(percent);
+		// the capture phase already filled the first progressBase_ percent
+		progressBar_->setValue(progressBase_ + percent * (100 - progressBase_) / 100);
 		statusLabel_->setText(QString::fromUtf8(text));
 		QCoreApplication::processEvents();
 		return !cancelRequested_;

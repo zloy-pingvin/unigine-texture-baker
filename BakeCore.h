@@ -37,7 +37,15 @@ struct Settings
 	// White = cast the ray along the triangle's geometric normal (no skew, like
 	// Marmoset's paint skew), black = smoothed cage normal, gray = blend.
 	bool useSkewMask = true;
-	bool bakeEmission = false; // additionally bake the emission texture (_e)
+	// Which maps of the set to write. A map left out is not saved and its path
+	// comes back empty, so the material keeps the texture it already has: that
+	// is what makes a single-map re-bake possible (emission came out wrong ->
+	// bake _e alone, without touching the albedo the user already accepted).
+	// Ray tracing still runs in full — the maps share one traversal.
+	bool bakeAlbedo = true;    // _alb
+	bool bakeShading = true;   // _sh
+	bool bakeNormal = true;    // _n
+	bool bakeEmission = false; // _e; also enables the Emission state on the material
 	// project the scene's world decals (DecalOrtho/Proj/Mesh) onto the bake, so
 	// stickers/labels/dirt that live as separate decal nodes end up in the
 	// low-poly texture set.

@@ -1979,12 +1979,12 @@ Result bake(const std::vector<BakeGroup> &groups,
 		return true;
 	};
 
-	if (anyAlbedo || settings.debugZones)
+	if (settings.bakeAlbedo && (anyAlbedo || settings.debugZones))
 	{
 		if (!writeImage("_alb", 4, accAlbedo, 4, result.albedoPath))
 			return fail("Failed to save the albedo texture.");
 	}
-	if (anyShading)
+	if (settings.bakeShading && anyShading)
 	{
 		if (!writeImage("_sh", 4, accShading, 4, result.shadingPath))
 			return fail("Failed to save the shading texture (_sh).");
@@ -1996,6 +1996,7 @@ Result bake(const std::vector<BakeGroup> &groups,
 	}
 
 	// normal: encode from [-1..1] to [0..1]
+	if (settings.bakeNormal)
 	{
 		std::vector<float> encoded(pixelCount * 3);
 		for (size_t i = 0; i < pixelCount; i++)
@@ -2027,14 +2028,35 @@ Result bake(const std::vector<BakeGroup> &groups,
 // pipeline (a raw normal map renders broken until the next reimport).
 void assignMaterial(const std::vector<BakeGroup> &groups, Result &result)
 {
-	if (groups.empty() || groups[0].lows.empty() || result.normalPath.empty())
+	if (groups.empty() || groups[0].lows.empty())
+		return;
+	// Any written map identifies the set — a single-map re-bake leaves the other
+	// paths empty, and keying off the normal alone would silently skip the whole
+	// material assignment whenever _n was not one of the selected maps.
+	struct NamedPath
+	{
+		const String &path;
+		const char *suffix;
+	};
+	const NamedPath candidates[] = {{result.normalPath, "_n"}, {result.albedoPath, "_alb"},
+		{result.shadingPath, "_sh"}, {result.emissionPath, "_e"}};
+	const NamedPath *source = nullptr;
+	for (const NamedPath &c : candidates)
+		if (!c.path.empty())
+		{
+			source = &c;
+			break;
+		}
+	if (!source)
 		return;
 	const Ptr<ObjectMeshStatic> &firstLow = groups[0].lows[0];
 
-	String virtualDir = pathDir(result.normalPath);
-	String baseName = pathBaseName(result.normalPath);
-	if (baseName.size() > 2 && !strcmp(baseName.get() + baseName.size() - 2, "_n"))
-		baseName = baseName.substr(0, baseName.size() - 2);
+	String virtualDir = pathDir(source->path);
+	String baseName = pathBaseName(source->path);
+	const size_t suffixLen = strlen(source->suffix);
+	if (baseName.size() > int(suffixLen)
+		&& !strcmp(baseName.get() + baseName.size() - suffixLen, source->suffix))
+		baseName = baseName.substr(0, baseName.size() - int(suffixLen));
 
 	MaterialPtr mat = firstLow->getMaterial(0);
 	if (!mat || mat->isBase())

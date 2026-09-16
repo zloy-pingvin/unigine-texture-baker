@@ -4,7 +4,7 @@ Plugin that bakes texture sets from a high-poly model (multi-material model) ont
 
 Typical use: baking full texture sets for simplified distant LODs of multi-material models.
 
-![UNIGINE](https://img.shields.io/badge/UNIGINE-2.21-blue) ![License](https://img.shields.io/badge/license-MIT-green)
+![UNIGINE](https://img.shields.io/badge/UNIGINE-2.22-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
 ## Features
 
@@ -16,14 +16,16 @@ Typical use: baking full texture sets for simplified distant LODs of multi-mater
 - **Per-part cage**: every low-poly part can carry its own frontal/rear distance, edited in the front/back columns of the participants list. **Fit cage** probes each part with rays and picks the smallest distances that still catch its high-poly; the global pair is the ceiling, so one distant part no longer forces a big cage on the whole model
 - Frontal/rear cage distances, 4–64 samples per texel, edge dilation
 - **Emission** (`_e`): RGB is the glow colour, alpha is a glow mask (opaque where the material's Emission state is on) for compositing elsewhere
+- **Selectable maps**: `_alb` / `_sh` / `_n` / `_e` each have their own checkbox. An unchecked map is not written and the material keeps its current texture, so one map can be re-baked on its own without touching the ones already accepted
+- Captures run in **chunks sized to free video memory**, so peak VRAM does not grow with the surface count and large models no longer risk a GPU device reset
 - Baked textures are saved next to the low-poly asset; the material is created or updated automatically
 - Drag & drop from World Nodes; per-slot viewport Hide buttons that never affect baking
 - UI in English and Russian (follows the editor language)
 
 ## Requirements
 
-- UNIGINE SDK **2.21** (float or double, x64), engine + editor headers and libraries
-- Qt **6.5.3** (the version the 2.21 editor is built with): `msvc2019_64` on Windows, `gcc_64` on Linux
+- UNIGINE SDK **2.22** (float or double, x64), engine + editor headers and libraries
+- Qt **6.5.3** (the version the 2.22 editor is built with): `msvc2019_64` on Windows, `gcc_64` on Linux
 - Windows: MSVC (Visual Studio 2022+), CMake 3.19+, Ninja
 - Linux: gcc 11+, CMake 3.19+, Ninja
 
@@ -88,8 +90,10 @@ Disable to sample only the base material textures on the CPU (faster, but layere
 (a tiling UV set often collapses part of the mesh to zero area, which renders nothing); ties go to less chart overlap, then fewer charts. The choice is logged to the console. 
 Change only if a second-UV-driven layer bakes wrong.
 - Capture size (auto / 512 / 1024 / 2048) - the GPU capture size per high-poly surface. It caps the detail of the "as rendered" mode regardless of the bake resolution, 
-so baking at 4096 gains little if the capture is smaller. Auto divides a budget of 50% of free RAM (16 GB max) by the surface count; a manual size ignores that budget, 
-and if RAM runs short the captures come back black and those surfaces bake from the material textures instead. The resolved size and its RAM usage are shown at the bottom of the window.
+so baking at 4096 gains little if the capture is smaller. Auto budgets the size against free system RAM, which has to hold the whole capture set at once. Video memory is 
+budgeted separately: captures are issued in chunks that fit free VRAM, so peak video memory does not grow with the surface count and a small GPU costs extra passes rather 
+than quality. A manual size ignores both budgets, and if memory runs short the captures come back black and those surfaces bake from the material textures instead. 
+The resolved size, the chunk size and the estimated usage are shown at the bottom of the window.
 - Invert G (Y) - extra inversion of the normal map green channel. Normally not needed; enable only if the baked relief looks inverted.
 - Colorize hit zones - bakes a diagnostic colorization instead of albedo: green - the ray hit a surface above the low-poly, blue - below, red - a back face, yellow - the skew mask area, 
 black/stretched - a miss. Also dumps the GPU capture atlases to the system temp folder (baker_captures) for inspection.
